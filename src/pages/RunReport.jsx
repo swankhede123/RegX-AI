@@ -1,11 +1,13 @@
 import React, { useState } from 'react';
-import axios from 'axios';
+import api from '../api';
 import { API_BASE_URL } from '../config';
+import { useTaskContext } from '../context/TaskContext';
 import './RunReport.css';
 
 const API_BASE = `${API_BASE_URL}/mcp/regression`;
 
 export default function RunReport() {
+  const { addTask, updateTask: updateTaskCtx } = useTaskContext();
   const [runFolder, setRunFolder] = useState('');
   const [loading, setLoading] = useState(false);
   const [qiData, setQiData] = useState(null);
@@ -29,7 +31,7 @@ export default function RunReport() {
     setSelectedAnalysisFile('');
 
     try {
-      const response = await axios.post(`${API_BASE}/run-report/list-analysis-files`, {
+      const response = await api.post(`${API_BASE}/run-report/list-analysis-files`, {
         folder_path: runFolder.trim()
       });
 
@@ -60,27 +62,32 @@ export default function RunReport() {
     setLoading(true);
     setError(null);
     setQiData(null);
+    const taskId = addTask({ label: `QI Analysis: ${runFolder.split('/').pop()}`, page: 'Run Report' });
 
     try {
       const payload = {
         run_folder: runFolder.trim()
       };
 
-      // If using existing file, include the file name
       if (useExistingFile && selectedAnalysisFile) {
         payload.analysis_file = selectedAnalysisFile;
       }
 
-      const response = await axios.post(`${API_BASE}/run-report/qi-analysis`, payload);
+      const response = await api.post(`${API_BASE}/run-report/qi-analysis`, payload);
 
       if (response.data.success) {
         setQiData(response.data);
+        updateTaskCtx(taskId, { status: 'success', detail: `Analysis complete: ${response.data.analysis_file}` });
       } else {
-        setError(response.data.error || 'Failed to analyze QI data');
+        const msg = response.data.error || 'Failed to analyze QI data';
+        setError(msg);
+        updateTaskCtx(taskId, { status: 'error', detail: msg });
       }
     } catch (err) {
       console.error('Error analyzing QI data:', err);
-      setError(err.response?.data?.error || err.message || 'Failed to analyze QI data');
+      const msg = err.response?.data?.error || err.message || 'Failed to analyze QI data';
+      setError(msg);
+      updateTaskCtx(taskId, { status: 'error', detail: msg });
     } finally {
       setLoading(false);
     }
@@ -106,7 +113,7 @@ export default function RunReport() {
     const branchName = runFolder.split('/').pop() || 'Unknown Branch';
 
     try {
-      const response = await axios.post(`${API_BASE}/run-report/preview-email`, {
+      const response = await api.post(`${API_BASE}/run-report/preview-email`, {
         bugs: eligibleBugs,
         branch_name: branchName,
         run_folder: runFolder
@@ -130,8 +137,9 @@ export default function RunReport() {
     }
 
     setSendingEmail(true);
+    const emailTaskId = addTask({ label: `Send QI email: ${emailPreview.branch_name}`, page: 'Run Report' });
     try {
-      const response = await axios.post(`${API_BASE}/run-report/send-email`, {
+      const response = await api.post(`${API_BASE}/run-report/send-email`, {
         bugs: emailPreview.bugs,
         branch_name: emailPreview.branch_name,
         run_folder: emailPreview.run_folder,
@@ -140,14 +148,19 @@ export default function RunReport() {
 
       if (response.data.success) {
         alert(`Email sent successfully to ${emailPreview.recipients.length} recipient(s)`);
+        updateTaskCtx(emailTaskId, { status: 'success', detail: `Sent to ${emailPreview.recipients.length} recipient(s)` });
         setShowEmailPreview(false);
         setEmailPreview(null);
       } else {
-        alert(`Failed to send email: ${response.data.error || 'Unknown error'}`);
+        const msg = response.data.error || 'Unknown error';
+        alert(`Failed to send email: ${msg}`);
+        updateTaskCtx(emailTaskId, { status: 'error', detail: msg });
       }
     } catch (err) {
       console.error('Error sending email:', err);
-      alert(`Failed to send email: ${err.response?.data?.error || err.message || 'Unknown error'}`);
+      const msg = err.response?.data?.error || err.message || 'Unknown error';
+      alert(`Failed to send email: ${msg}`);
+      updateTaskCtx(emailTaskId, { status: 'error', detail: msg });
     } finally {
       setSendingEmail(false);
     }

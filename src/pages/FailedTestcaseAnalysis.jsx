@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import axios from 'axios';
+import api from '../api';
 import { API_BASE_URL } from '../config';
 import './FailedTestcaseAnalysis.css';
 
@@ -107,7 +107,10 @@ export default function FailedTestcaseAnalysis() {
     const url = `${API_BASE}/analyze-stream?${searchParams.toString()}`;
 
     try {
-      const response = await fetch(url);
+      const token = localStorage.getItem('regx_auth_token');
+      const response = await fetch(url, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}));
         setError(errData.error || `Request failed: ${response.status}`);
@@ -233,7 +236,7 @@ export default function FailedTestcaseAnalysis() {
     const key = `${testName}|${sameBranch}`;
     if (historyCache[key]) return historyCache[key];
     try {
-      const { data } = await axios.get(`${API_BASE}/history`, {
+      const { data } = await api.get(`${API_BASE}/history`, {
         params: { test_name: testName, branch: currentBranch, same_branch: sameBranch, tag: analysisTag }
       });
       const runs = data.runs || [];
@@ -245,7 +248,7 @@ export default function FailedTestcaseAnalysis() {
   }, [analysisTag, currentBranch, historyCache]);
 
   const applyTriageUpdate = async (testId, comment, jiraTicket) => {
-    const { data } = await axios.put(`${API_BASE}/update-triage`, {
+    const { data } = await api.put(`${API_BASE}/update-triage`, {
       test_id: testId,
       comment: comment || '',
       jira_ticket: jiraTicket || undefined

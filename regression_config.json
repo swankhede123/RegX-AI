@@ -1,12 +1,10 @@
 {
   "input_mode": "tag",
-  "default_tag": "cdp_reg_751_run_5",
+  "default_tag": "master|cdp-apr-25-2026|full_reg",
   "added_tags": [
-    "cdp_reg_751_run_5",
-    "7.6|reg1-mar-17-2026",
-    "cdp_reg_gs_751_run_2",
-    "cdp_reg_751_run_2"
+    "master|cdp-apr-25-2026|full_reg",
+    "7.6|reg3-apr-17-2026"
   ],
-  "tag": "cdp_reg_751_run_5",
+  "tag": "master|cdp-apr-25-2026|full_reg",
   "task_ids": []
 }

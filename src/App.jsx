@@ -6,34 +6,24 @@ import TestcaseManagement from './pages/TestcaseManagement';
 import TriageGenie from './pages/TriageGenie';
 import RunReport from './pages/RunReport';
 import DynamicJobProfile from './pages/DynamicJobProfile';
+import ManageJobProfile from './pages/ManageJobProfile';
 import FailedTestcaseAnalysis from './pages/FailedTestcaseAnalysis';
+import { TaskProvider } from './context/TaskContext';
+import { AuthProvider, useAuth } from './context/AuthContext';
+import TaskStatusIcon from './components/TaskStatusIcon';
+import LoginPage from './components/LoginPage';
 import './App.css';
 
-function App() {
+function Dashboard() {
+  const { user, logout } = useAuth();
   const [activePage, setActivePage] = useState('home');
   const [menuVisible, setMenuVisible] = useState(true);
 
-  // Listen for navigation events from Run Plan
   useEffect(() => {
     const handleSetActivePage = (event) => {
       setActivePage(event.detail);
     };
-    
     window.addEventListener('setActivePage', handleSetActivePage);
-    
-    return () => {
-      window.removeEventListener('setActivePage', handleSetActivePage);
-    };
-  }, []);
-
-  // Listen for navigation events from Run Plan
-  useEffect(() => {
-    const handleSetActivePage = (event) => {
-      setActivePage(event.detail);
-    };
-    
-    window.addEventListener('setActivePage', handleSetActivePage);
-    
     return () => {
       window.removeEventListener('setActivePage', handleSetActivePage);
     };
@@ -48,6 +38,7 @@ function App() {
     { id: 'failed-analysis', label: 'Failed Testcase Analysis', icon: '🔍', description: 'AI-Powered Failure Analysis' },
     { id: 'run-report', label: 'Run Report', icon: '📊', description: 'QI Analysis' },
     { id: 'job-profile', label: 'Dynamic Job Profile', icon: '⚙️', description: 'Job Profile Creation' },
+    { id: 'manage-jp', label: 'Manage JP / TS', icon: '🗑️', description: 'Search & Delete JP/TS' },
   ];
 
   const renderPage = () => {
@@ -68,58 +59,93 @@ function App() {
         return <RunReport />;
       case 'job-profile':
         return <DynamicJobProfile />;
+      case 'manage-jp':
+        return <ManageJobProfile />;
       default:
         return <RegressionHome />;
     }
   };
 
+  const displayName = user?.name || user?.sub || 'User';
+
   return (
-    <div className="app-container">
-      {/* Navigation Sidebar */}
-      <nav className={`sidebar ${menuVisible ? '' : 'collapsed'}`}>
-        <div className="sidebar-header">
-          <h2>Regression Dashboard</h2>
-          <button
-            className="menu-toggle-btn"
-            onClick={() => setMenuVisible(!menuVisible)}
-            title={menuVisible ? 'Hide Menu' : 'Show Menu'}
-          >
-            {menuVisible ? '◀' : '▶'}
-          </button>
-        </div>
-        <ul className="menu-list">
-          {menuItems.map((item) => (
-            <li
-              key={item.id}
-              className={`menu-item ${activePage === item.id ? 'active' : ''}`}
-              onClick={() => setActivePage(item.id)}
+    <TaskProvider>
+      <div className="app-container">
+        <nav className={`sidebar ${menuVisible ? '' : 'collapsed'}`}>
+          <div className="sidebar-header">
+            <h2>Regression Dashboard</h2>
+            <button
+              className="menu-toggle-btn"
+              onClick={() => setMenuVisible(!menuVisible)}
+              title={menuVisible ? 'Hide Menu' : 'Show Menu'}
             >
-              <span className="menu-icon">{item.icon}</span>
-              <div className="menu-content">
-                <span className="menu-label">{item.label}</span>
-                <span className="menu-description">{item.description}</span>
-              </div>
-            </li>
-          ))}
-        </ul>
-      </nav>
+              {menuVisible ? '◀' : '▶'}
+            </button>
+          </div>
+          <div className="sidebar-user-info">
+            <span className="sidebar-user-name" title={user?.email || ''}>
+              {displayName}
+            </span>
+            <button className="sidebar-logout-btn" onClick={logout} title="Sign out">
+              Logout
+            </button>
+          </div>
+          <ul className="menu-list">
+            {menuItems.map((item) => (
+              <li
+                key={item.id}
+                className={`menu-item ${activePage === item.id ? 'active' : ''}`}
+                onClick={() => setActivePage(item.id)}
+              >
+                <span className="menu-icon">{item.icon}</span>
+                <div className="menu-content">
+                  <span className="menu-label">{item.label}</span>
+                  <span className="menu-description">{item.description}</span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </nav>
 
-      {/* Floating Toggle Button (when menu is hidden) */}
-      {!menuVisible && (
-        <button
-          className="floating-menu-toggle"
-          onClick={() => setMenuVisible(true)}
-          title="Show Menu"
-        >
-          ☰
-        </button>
-      )}
+        {!menuVisible && (
+          <button
+            className="floating-menu-toggle"
+            onClick={() => setMenuVisible(true)}
+            title="Show Menu"
+          >
+            ☰
+          </button>
+        )}
 
-      {/* Main Content Area */}
-      <main className={`main-content ${menuVisible ? '' : 'expanded'}`}>
-        {renderPage()}
-      </main>
-    </div>
+        <main className={`main-content ${menuVisible ? '' : 'expanded'}`}>
+          {renderPage()}
+        </main>
+
+        <TaskStatusIcon />
+      </div>
+    </TaskProvider>
+  );
+}
+
+function AppGate() {
+  const { isAuthenticated, loading } = useAuth();
+
+  if (loading) {
+    return (
+      <div className="login-wrapper" style={{ color: 'rgba(255,255,255,0.6)', fontSize: 16 }}>
+        Loading...
+      </div>
+    );
+  }
+
+  return isAuthenticated ? <Dashboard /> : <LoginPage />;
+}
+
+function App() {
+  return (
+    <AuthProvider>
+      <AppGate />
+    </AuthProvider>
   );
 }
 

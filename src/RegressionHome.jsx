@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import axios from "axios";
+import api from "./api";
 import { API_BASE_URL } from "./config";
 import "./RegressionHome.css";
 
@@ -7,6 +7,8 @@ const API_URL = `${API_BASE_URL}/mcp/regression/home`;
 const MANUAL_TASKS_API = `${API_BASE_URL}/mcp/regression/manual-tasks`;
 const CONFIG_API = `${API_BASE_URL}/mcp/regression/config`;
 const CONFIG_TAGS_API = `${API_BASE_URL}/mcp/regression/config/tags`;
+const TCMS_OVERALL_QI_API = `${API_BASE_URL}/mcp/regression/tcms-overall-qi`;
+const TEAM_CONFIG_API = `${API_BASE_URL}/mcp/regression/team-config`;
 const DEFAULT_TAG = "cdp_master_full_reg";
 const JITA_RESULTS_URL = "https://jita.eng.nutanix.com/results?task_ids=";
 const JIRA_URL = "https://jira.nutanix.com/browse/";
@@ -77,6 +79,9 @@ export default function RegressionHome() {
   const [triageAccuracyData, setTriageAccuracyData] = useState(null);
   const [loadingTriageAccuracy, setLoadingTriageAccuracy] = useState(false);
   const [configLoaded, setConfigLoaded] = useState(false); // Track if config has been loaded from JSON
+  const [branchQiData, setBranchQiData] = useState({});
+  const [branchQiLoading, setBranchQiLoading] = useState({});
+  const [teamConfig, setTeamConfig] = useState(null);
 
   // Parse JITA task link or comma-separated task IDs
   const parseTaskIds = (input) => {
@@ -105,7 +110,7 @@ export default function RegressionHome() {
   useEffect(() => {
     const loadConfigFromJSON = async () => {
       try {
-        const response = await axios.get(CONFIG_API);
+        const response = await api.get(CONFIG_API);
         const config = response.data;
         
         setAddedTags(config.added_tags || []);
@@ -142,12 +147,16 @@ export default function RegressionHome() {
     };
     
     loadConfigFromJSON();
+
+    api.get(TEAM_CONFIG_API)
+      .then((res) => setTeamConfig(res.data?.team_config || {}))
+      .catch((err) => console.error("Error loading team config:", err));
   }, []); // Only run on mount
 
   // When config modal opens, refresh config to sync addedTags and defaultTag
   useEffect(() => {
     if (showConfigModal) {
-      axios.get(CONFIG_API).then((res) => {
+      api.get(CONFIG_API).then((res) => {
         const c = res.data;
         setAddedTags(c.added_tags || []);
         setDefaultTag(c.default_tag || null);
@@ -162,7 +171,7 @@ export default function RegressionHome() {
   const fetchData = async (params) => {
     try {
       setLoading(true);
-      const response = await axios.get(API_URL, { params });
+      const response = await api.get(API_URL, { params });
       if (response.data && response.data.runs && Array.isArray(response.data.runs)) {
         // Debug: Log branch information for troubleshooting
         console.log("Raw runs data:", response.data.runs.map(r => ({ task_id: r.task_id, branch: r.branch, label: r.label })));
@@ -313,7 +322,7 @@ export default function RegressionHome() {
     await Promise.all(
       branches.map(async (branch) => {
         try {
-          const res = await axios.get(MANUAL_TASKS_API, {
+          const res = await api.get(MANUAL_TASKS_API, {
             params: { tag: tag, branch }
           });
           tasks[branch] = res.data.manual_tasks || [];
@@ -331,7 +340,7 @@ export default function RegressionHome() {
     if (!newTaskId.trim()) return;
 
     try {
-      const res = await axios.post(MANUAL_TASKS_API, {
+      const res = await api.post(MANUAL_TASKS_API, {
         tag: tag,
         branch,
         task_ids: [newTaskId.trim()]
@@ -351,7 +360,7 @@ export default function RegressionHome() {
   // Remove manual task
   const handleRemoveManualTask = async (branch, taskId) => {
     try {
-      const res = await axios.delete(MANUAL_TASKS_API, {
+      const res = await api.delete(MANUAL_TASKS_API, {
         params: { tag: tag, branch, task_id: taskId }
       });
       setManualTasks(prev => ({
@@ -378,7 +387,7 @@ export default function RegressionHome() {
           tag: selectedTag || "",
           task_ids: []
         };
-        await axios.post(CONFIG_API, configData);
+        await api.post(CONFIG_API, configData);
         
         // Update local state
         setTag(selectedTag || null);
@@ -394,6 +403,9 @@ export default function RegressionHome() {
         // Close modal first
         setShowConfigModal(false);
         
+        // Clear cached QI data so buttons re-appear for fresh load
+        setBranchQiData({});
+
         // Fetch data only if a tag is selected
         if (selectedTag) {
           await fetchData({ tag: selectedTag });
@@ -431,7 +443,7 @@ export default function RegressionHome() {
           tag: "",
           task_ids: taskIds
         };
-        await axios.post(CONFIG_API, configData);
+        await api.post(CONFIG_API, configData);
         
         // Store task IDs and clear tag
         setTag(null);
@@ -447,6 +459,9 @@ export default function RegressionHome() {
         
         // Close modal first
         setShowConfigModal(false);
+
+        // Clear cached QI data so buttons re-appear for fresh load
+        setBranchQiData({});
         
         // Fetch data automatically after save
         await fetchData({ task_ids: taskIds.join(",") });
@@ -488,7 +503,7 @@ export default function RegressionHome() {
     }
     setLoadingBranches(true);
     try {
-      const response = await axios.post(CONFIG_TAGS_API, { tag: tagToAdd });
+      const response = await api.post(CONFIG_TAGS_API, { tag: tagToAdd });
       const updatedAdded = response.data.added_tags || [];
       setAddedTags(updatedAdded);
       setNewTagInput("");
@@ -499,7 +514,7 @@ export default function RegressionHome() {
         setConfigTagInput(tagToAdd);
       }
       // Preload triage accuracy data in background (saves to per-tag JSON)
-      axios.get(`${API_BASE_URL}/mcp/regression/triage-accuracy`, { params: { tag: tagToAdd } })
+      api.get(`${API_BASE_URL}/mcp/regression/triage-accuracy`, { params: { tag: tagToAdd } })
         .then(() => { /* cache warmed */ })
         .catch(() => { /* non-blocking; user can load later when selecting tag */ });
     } catch (err) {
@@ -513,7 +528,7 @@ export default function RegressionHome() {
   const handleDeleteTag = async (tagToDelete) => {
     if (!window.confirm(`Delete tag "${tagToDelete}"? This will also remove its triage accuracy data.`)) return;
     try {
-      const response = await axios.delete(CONFIG_TAGS_API, {
+      const response = await api.delete(CONFIG_TAGS_API, {
         params: { tag: tagToDelete }
       });
       setAddedTags(response.data.added_tags || []);
@@ -536,7 +551,7 @@ export default function RegressionHome() {
     
     setLoadingBranches(true);
     try {
-      const response = await axios.get(`${API_BASE_URL}/mcp/regression/branches`, {
+      const response = await api.get(`${API_BASE_URL}/mcp/regression/branches`, {
         params: { tag: tagName.trim() }
       });
       setAvailableBranches(response.data.branches || []);
@@ -617,7 +632,7 @@ export default function RegressionHome() {
         params.reload = "true";
         params._t = Date.now(); // Cache-bust to avoid any HTTP caching
       }
-      const response = await axios.get(`${API_BASE_URL}/mcp/regression/triage-accuracy`, {
+      const response = await api.get(`${API_BASE_URL}/mcp/regression/triage-accuracy`, {
         params,
         timeout: 900000, // 15 minutes - Triage Genie lookups can be slow for large runs
         headers: reload ? { "Cache-Control": "no-cache", "Pragma": "no-cache" } : {}
@@ -680,7 +695,7 @@ export default function RegressionHome() {
       if (inputMode === "tag" && effectiveTag) {
         params.tag = effectiveTag;
       }
-      const response = await axios.get(`${API_BASE_URL}/mcp/regression/triage-accuracy/export-excel`, {
+      const response = await api.get(`${API_BASE_URL}/mcp/regression/triage-accuracy/export-excel`, {
         params,
         responseType: "blob",
       });
@@ -732,7 +747,7 @@ export default function RegressionHome() {
         params.include_bulk_qi = "true";
       }
       
-      const response = await axios.get(`${API_BASE_URL}/mcp/regression/triage-count`, {
+      const response = await api.get(`${API_BASE_URL}/mcp/regression/triage-count`, {
         params,
         timeout: 180000 // 3 minutes timeout
       });
@@ -774,7 +789,7 @@ export default function RegressionHome() {
       // Request bulk QI calculation
       params.include_bulk_qi = "true";
       
-      const response = await axios.get(`${API_BASE_URL}/mcp/regression/triage-count`, {
+      const response = await api.get(`${API_BASE_URL}/mcp/regression/triage-count`, {
         params,
         timeout: 300000 // 5 minutes timeout for QI calculation
       });
@@ -822,7 +837,7 @@ export default function RegressionHome() {
         }
       }
       
-      const response = await axios.get(`${API_BASE_URL}/mcp/regression/qi-summary`, {
+      const response = await api.get(`${API_BASE_URL}/mcp/regression/qi-summary`, {
         params,
         timeout: 180000 // 3 minutes timeout
       });
@@ -832,6 +847,45 @@ export default function RegressionHome() {
       setQiSummaryReport({ error: "Failed to fetch QI Summary Report. Please check backend endpoint." });
     } finally {
       setLoadingQiSummary(false);
+    }
+  };
+
+  const resolveTeamName = (currentTag) => {
+    if (!teamConfig) return "CDP";
+    const cfg = teamConfig[currentTag] || teamConfig["default"];
+    return cfg ? cfg.team : "CDP";
+  };
+
+  const fetchBranchQi = async (branch, timeFilter) => {
+    const qiKey = `${branch}_${timeFilter}`;
+    setBranchQiLoading((prev) => ({ ...prev, [qiKey]: true }));
+    try {
+      const teamName = resolveTeamName(tag);
+      const dateOnly = timeFilter === "all" ? "all" : timeFilter.split(" ")[0];
+      const response = await api.get(TCMS_OVERALL_QI_API, {
+        params: { team_name: teamName, branch_name: branch, time_filter: dateOnly },
+        timeout: 60000,
+      });
+      const qiValue = response.data?.qi_value;
+      setBranchQiData((prev) => ({
+        ...prev,
+        [branch]: {
+          ...prev[branch],
+          [timeFilter === "all" ? "overall" : "customDate"]: qiValue,
+          [timeFilter === "all" ? "overallDetail" : "customDateDetail"]: response.data,
+        },
+      }));
+    } catch (err) {
+      console.error(`Error fetching QI for branch ${branch}:`, err);
+      setBranchQiData((prev) => ({
+        ...prev,
+        [branch]: {
+          ...prev[branch],
+          [timeFilter === "all" ? "overall" : "customDate"]: "error",
+        },
+      }));
+    } finally {
+      setBranchQiLoading((prev) => ({ ...prev, [qiKey]: false }));
     }
   };
 
@@ -878,7 +932,7 @@ export default function RegressionHome() {
                   localStorage.setItem("regressionDashboardTag", selected || "");
                   if (selected) {
                     try {
-                      await axios.post(CONFIG_API, {
+                      await api.post(CONFIG_API, {
                         input_mode: "tag",
                         default_tag: selected,
                         added_tags: addedTags,
@@ -888,6 +942,7 @@ export default function RegressionHome() {
                     } catch (err) {
                       console.error("Failed to save tag config:", err);
                     }
+                    setBranchQiData({});
                     await fetchData({ tag: selected });
                     await fetchTriageCount(selected);
                     if (advancedOptions.qiSummaryReport) await fetchQiSummaryReport(selected);
@@ -897,8 +952,9 @@ export default function RegressionHome() {
                     setTriageCount(null);
                     setTriageAccuracyData(null);
                     setQiSummaryReport(null);
+                    setBranchQiData({});
                     try {
-                      await axios.post(CONFIG_API, {
+                      await api.post(CONFIG_API, {
                         input_mode: "tag",
                         default_tag: null,
                         added_tags: addedTags,
@@ -1482,6 +1538,7 @@ export default function RegressionHome() {
               <th>Manual Tasks</th>
               <th>Merged Tasks</th>
               <th colSpan="2" style={{ textAlign: "center" }}>Tests Overview</th>
+              <th style={{ textAlign: "center" }}>Overall QI</th>
             </tr>
           </thead>
 
@@ -1628,6 +1685,75 @@ export default function RegressionHome() {
                         <div style={{ color: "#6f42c1" }}>{row.running || 0}</div>
                       </div>
                     </div>
+                  </td>
+                  <td style={{ textAlign: "center", verticalAlign: "middle", minWidth: "140px" }}>
+                    {(() => {
+                      const qiData = branchQiData[row.branch];
+                      const overallLoading = branchQiLoading[`${row.branch}_all`];
+                      const customDateStr = row.startDate ? row.startDate.split(" ")[0] : null;
+                      const customLoading = customDateStr && branchQiLoading[`${row.branch}_${row.startDate}`];
+                      const qiColor = (val) =>
+                        val === "error" ? "#dc3545"
+                        : val >= 80 ? "#28a745"
+                        : val >= 50 ? "#fd7e14"
+                        : "#dc3545";
+                      return (
+                        <div style={{ fontSize: "12px" }}>
+                          {/* Overall QI (time_filter=all) */}
+                          <div style={{ marginBottom: "8px" }}>
+                            {qiData?.overall != null && qiData.overall !== "error" ? (
+                              <div style={{ fontWeight: "bold", color: qiColor(qiData.overall) }}>
+                                {qiData.overall}%
+                                <div style={{ fontWeight: "normal", color: "#666", fontSize: "10px" }}>Overall QI</div>
+                              </div>
+                            ) : qiData?.overall === "error" ? (
+                              <div style={{ color: "#dc3545", fontSize: "11px" }}>Failed</div>
+                            ) : overallLoading ? (
+                              <span style={{ color: "#666", fontStyle: "italic" }}>Loading...</span>
+                            ) : (
+                              <button
+                                onClick={() => fetchBranchQi(row.branch, "all")}
+                                style={{
+                                  padding: "3px 8px", fontSize: "11px", cursor: "pointer",
+                                  background: "#007bff", color: "white", border: "none",
+                                  borderRadius: "3px",
+                                }}
+                              >
+                                Overall QI
+                              </button>
+                            )}
+                          </div>
+                          {/* Custom Date QI (time_filter=startDate) */}
+                          {customDateStr && (
+                            <div>
+                              {qiData?.customDate != null && qiData.customDate !== "error" ? (
+                                <div style={{ fontWeight: "bold", color: qiColor(qiData.customDate) }}>
+                                  {qiData.customDate}%
+                                  <div style={{ fontWeight: "normal", color: "#666", fontSize: "10px" }}>
+                                    QI ({customDateStr})
+                                  </div>
+                                </div>
+                              ) : qiData?.customDate === "error" ? (
+                                <div style={{ color: "#dc3545", fontSize: "11px" }}>Failed</div>
+                              ) : customLoading ? (
+                                <span style={{ color: "#666", fontStyle: "italic" }}>Loading...</span>
+                              ) : (
+                                <button
+                                  onClick={() => fetchBranchQi(row.branch, row.startDate)}
+                                  style={{
+                                    padding: "3px 8px", fontSize: "11px", cursor: "pointer",
+                                    background: "#17a2b8", color: "white", border: "none",
+                                    borderRadius: "3px",
+                                  }}
+                                >
+                                  QI ({customDateStr})
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
                   </td>
                 </tr>
               );

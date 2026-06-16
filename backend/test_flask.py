@@ -1,6 +1,7 @@
 import json
 import time
 import logging
+import threading
 import requests
 import urllib3
 import pandas as pd
@@ -11,6 +12,7 @@ import random
 import smtplib
 import urllib.request
 import urllib.error
+import urllib.parse
 import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -18,16 +20,18 @@ from collections import defaultdict
 from io import BytesIO
 from datetime import datetime, timedelta
 
-from flask import Flask, jsonify, request, Response, stream_with_context, send_file
+from flask import Flask, jsonify, request, Response, stream_with_context, send_file, g
 from flask_cors import CORS
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from auth import LDAPAuth, create_jwt, decode_jwt, jwt_required
 
 # ======================================================
 # Flask App
 # ======================================================
 app = Flask(__name__)
-CORS(app)
+CORS(app, supports_credentials=True)
 
 # ======================================================
 # Disable SSL warnings
@@ -52,6 +56,34 @@ TRIAGE_GENIE_BASE = "http://triage-genie.eng.nutanix.com/api"
 LOGIN_URL = os.getenv("TRIAGE_GENIE_LOGIN_URL", "http://triage-genie.eng.nutanix.com/login")
 PHX_BASE = "https://jita-phx1-webserver-2.eng.nutanix.com/api/v2"
 TCMS_BASE = "https://tcms.eng.nutanix.com/api-readonly/v1"
+TCMS_SUMMARY_BASE = "https://tcms.eng.nutanix.com/api/v1"
+TCMS_WRITE_BASE = "https://tcms.eng.nutanix.com/api/v1"
+TCMS_TESTDB_BASE = "https://quality-pipeline.eng.nutanix.com/testdb/api/v1"
+
+# TCMS auth (base64-encoded defaults; override with env vars in production)
+TCMS_USER = os.getenv("TCMS_USER", "agave_bot")
+TCMS_PASSWORD = os.getenv("TCMS_PASSWORD", "admin")
+
+TESTCASE_MGMT_DATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"
+)
+
+# Tag-to-team configuration for TCMS QI lookups.
+# Each key is a tag pattern; value holds the TCMS team name and fallback branch.
+# "default" is used when no specific tag match is found.
+TEAM_CONFIG = {
+    "cdp_master_full_reg": {"team": "CDP", "default_branch": "master"},
+    "default":             {"team": "CDP", "default_branch": "master"},
+}
+
+# Maps full branch names (as shown in the Run Summary table) to the short
+# milestone names expected by the TCMS API.  "master" stays as-is.
+BRANCH_SHORT_NAME_MAP = {
+    "master": "master",
+    "ganges-7.6-stable": "7.6",
+    "ganges-7.5-stable": "7.5",
+    "ganges-7.5.1-stable": "7.5.1",
+}
 
 # AI Endpoint for failure summary
 AI_BASE = "https://hkn12.ai.nutanix.com/enterpriseai/v1"
@@ -345,7 +377,10 @@ def fetch_regression_tasks(tag=None, task_ids=None):
         # Fetch tasks by tag (original behavior)
         raw_query = {
             "$or": [
-                {"created_by": "sudharshan.musali"},
+                {"created_by": {
+                    "$in": ["shilpa.sattigeri", "sudharshan.musali"]
+                    }
+                },
                 {"user_groups": {"$in": ["cdp_reg_jarvis"]}}
             ],
             "tester_tags": {"$in": [tag]},
@@ -487,7 +522,47 @@ def fetch_test_results_batch_with_pagination(task_ids, limit=2000, timeout=120):
         logger.error(f"Error fetching test results: {e}")
         raise
 
+# ======================================================
+# Auth Routes (no @jwt_required)
+# ======================================================
+@app.route("/mcp/regression/auth/login", methods=["POST"])
+def auth_login():
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "")
+
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+
+    ldap_auth = LDAPAuth()
+    user_info = ldap_auth.authenticate(username, password)
+    if user_info is None:
+        return jsonify({"error": "Invalid username or password"}), 401
+
+    token = create_jwt(
+        user_info["username"],
+        user_info.get("displayName", ""),
+        user_info.get("email", ""),
+    )
+    return jsonify({"token": token, "user": user_info})
+
+
+@app.route("/mcp/regression/auth/me", methods=["GET"])
+@jwt_required
+def auth_me():
+    return jsonify({"user": g.current_user})
+
+
+@app.route("/mcp/regression/auth/logout", methods=["POST"])
+def auth_logout():
+    return jsonify({"success": True})
+
+
+# ======================================================
+# Protected Routes
+# ======================================================
 @app.route("/mcp/regression/home", methods=["GET"])
+@jwt_required
 def regression_home():
     start = time.time()
 
@@ -510,8 +585,33 @@ def regression_home():
 
     # Store original requested task IDs for comparison
     requested_task_ids = task_ids.copy() if task_ids else None
-    
-    tasks = fetch_regression_tasks(tag=tag, task_ids=task_ids)
+
+    try:
+        tasks = fetch_regression_tasks(tag=tag, task_ids=task_ids)
+    except TimeoutError as e:
+        logger.error(f"Regression home: JITA task list timeout: {e}")
+        return jsonify({
+            "error": str(e),
+            "type": "jita_timeout",
+            "tag": tag,
+            "generated_at": datetime.utcnow().isoformat(),
+            "total_runs": 0,
+            "runs": [],
+            "branch_start_dates": {},
+            "oldest_start_date": None,
+        }), 504
+    except ConnectionError as e:
+        logger.error(f"Regression home: JITA connection error: {e}")
+        return jsonify({
+            "error": str(e),
+            "type": "jita_connection_error",
+            "tag": tag,
+            "generated_at": datetime.utcnow().isoformat(),
+            "total_runs": 0,
+            "runs": [],
+            "branch_start_dates": {},
+            "oldest_start_date": None,
+        }), 503
     
     # Log which task IDs were found vs requested
     if requested_task_ids and not tag:
@@ -778,6 +878,7 @@ def regression_home():
 # Manual Tasks Endpoints
 # ---------------------------------------------------
 @app.route("/mcp/regression/manual-tasks", methods=["GET"])
+@jwt_required
 def get_manual_tasks():
     tag = request.args.get("tag")
     branch = request.args.get("branch")
@@ -800,6 +901,7 @@ def get_manual_tasks():
 
 
 @app.route("/mcp/regression/manual-tasks", methods=["POST"])
+@jwt_required
 def add_manual_tasks():
     data = request.get_json()
     tag = data.get("tag")
@@ -836,6 +938,7 @@ def add_manual_tasks():
 
 
 @app.route("/mcp/regression/manual-tasks", methods=["DELETE"])
+@jwt_required
 def remove_manual_task():
     tag = request.args.get("tag")
     branch = request.args.get("branch")
@@ -866,6 +969,7 @@ def remove_manual_task():
 # Configuration Endpoints
 # ---------------------------------------------------
 @app.route("/mcp/regression/config", methods=["GET"])
+@jwt_required
 def get_regression_config():
     """Get regression dashboard configuration from JSON file"""
     try:
@@ -877,6 +981,7 @@ def get_regression_config():
 
 
 @app.route("/mcp/regression/config", methods=["POST"])
+@jwt_required
 def save_regression_config_endpoint():
     """Save regression dashboard configuration to JSON file"""
     try:
@@ -924,6 +1029,7 @@ def save_regression_config_endpoint():
 
 
 @app.route("/mcp/regression/config/tags", methods=["POST"])
+@jwt_required
 def add_config_tag():
     """Add a tag to added_tags. Validation is lenient - tag is added even if JITA returns empty."""
     try:
@@ -956,6 +1062,7 @@ def add_config_tag():
 
 
 @app.route("/mcp/regression/config/tags", methods=["DELETE"])
+@jwt_required
 def delete_config_tag():
     """Remove tag from added_tags and delete per-tag triage accuracy JSON."""
     try:
@@ -987,6 +1094,7 @@ def delete_config_tag():
 # Fetch Branches from Tag Endpoint
 # ---------------------------------------------------
 @app.route("/mcp/regression/branches", methods=["GET"])
+@jwt_required
 def get_branches_from_tag():
     tag = request.args.get("tag")
     
@@ -1241,9 +1349,313 @@ def fetch_qi_from_tcms(testcase_name, milestone="7.5.1"):
 
 
 # ---------------------------------------------------
+# TCMS Tags Fetch Endpoint
+# ---------------------------------------------------
+def _tcms_aggregate_headers():
+    h = {"Content-Type": "application/json", "Accept": "application/json"}
+    token = (
+        (os.getenv("TCMS_API_TOKEN") or os.getenv("TCMS_TOKEN") or os.getenv("TCMS_BEARER") or "")
+        .strip()
+    )
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
+
+
+def _tcms_aggregate_post(payload, timeout=60):
+    return requests.post(
+        f"{TCMS_BASE}/milestone_all_test_cases/aggregate",
+        json=payload,
+        headers=_tcms_aggregate_headers(),
+        verify=False,
+        timeout=timeout,
+    )
+
+
+def _tcms_response_rows(data):
+    """Normalize aggregate JSON body to a list of row dicts."""
+    if not data or not isinstance(data, dict):
+        return None
+    rows = data.get("data")
+    if rows is None:
+        rows = data.get("result") or data.get("rows") or data.get("items")
+    if not isinstance(rows, list):
+        return None
+    return rows
+
+
+def _parse_grouped_tag_ids(rows):
+    tags = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        tid = item.get("_id")
+        if tid is None or isinstance(tid, (dict, list)):
+            continue
+        s = str(tid).strip()
+        if s:
+            tags.append(s)
+    return tags
+
+
+def _tags_from_projected_docs(rows, *paths):
+    seen = set()
+    out = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        for p in paths:
+            t = item
+            for part in p.split("."):
+                if not isinstance(t, dict):
+                    t = None
+                    break
+                t = t.get(part)
+            if isinstance(t, list):
+                for x in t:
+                    if x and str(x).strip():
+                        s = str(x).strip()
+                        if s and s not in seen:
+                            seen.add(s)
+                            out.append(s)
+            elif t and str(t).strip():
+                s = str(t).strip()
+                if s and s not in seen:
+                    seen.add(s)
+                    out.append(s)
+    return sorted(out, key=str.lower)
+
+
+def _fetch_tcms_distinct_tags_group(milestone):
+    """$group distinct tag values (preferred, smallest payload)."""
+    payload = [
+        {
+            "$match": {
+                "$and": [
+                    {"target_milestone": milestone},
+                    {"deleted": False},
+                    {"test_case.deprecated": False},
+                    {"test_case.metadata.tags": {"$exists": True, "$ne": []}},
+                ]
+            }
+        },
+        {"$unwind": "$test_case.metadata.tags"},
+        {"$group": {"_id": "$test_case.metadata.tags"}},
+        {"$sort": {"_id": 1}},
+        {"$limit": 2000},
+    ]
+    r = _tcms_aggregate_post(payload)
+    if r.status_code != 200:
+        return None, r
+    j = r.json()
+    rows = _tcms_response_rows(j)
+    if not rows and j and j.get("data") is None and isinstance(j, dict) and "success" in j:
+        logger.warning(f"TCMS tags group: unexpected body keys: {list(j.keys())} snippet={str(j)[:400]}")
+    if not rows:
+        return [], r
+    return _parse_grouped_tag_ids(rows), r
+
+
+def _fetch_tcms_tags_project_scan(milestone, limit=5000):
+    """
+    Fallback: return many documents and build distinct tags in Python.
+    Handles different shapes / empty $group responses.
+    """
+    payload = [
+        {
+            "$match": {
+                "target_milestone": milestone,
+                "deleted": False,
+            }
+        },
+        {
+            "$project": {
+                "m_tags": "$test_case.metadata.tags",
+                "alt_tags": "$test_case.tags",
+            }
+        },
+        {"$limit": int(limit)},
+    ]
+    r = _tcms_aggregate_post(payload, timeout=90)
+    if r.status_code != 200:
+        return None, r
+    j = r.json()
+    rows = _tcms_response_rows(j)
+    if not rows:
+        return [], r
+    tags = _tags_from_projected_docs(rows, "m_tags", "alt_tags")
+    return tags, r
+
+
+@app.route("/mcp/regression/tcms/tags", methods=["GET"])
+def fetch_tcms_tags():
+    """
+    Fetch available tags from TCMS API for a given milestone.
+    Query params: milestone (default: env TCMS_MILESTONE or 7.5.1)
+    On empty result, tries TCMS_MILESTONE_FALLBACKS (comma env) and project-scan fallback.
+    Set TCMS_API_TOKEN if your TCMS read requires bearer auth.
+    """
+    try:
+        default_ms = (os.getenv("TCMS_MILESTONE") or "7.5.1").strip()
+        milestone = (request.args.get("milestone") or default_ms).strip()
+        raw_fb = (os.getenv("TCMS_MILESTONE_FALLBACKS") or "7.5,7.5.1,7.3,7.3.1").strip()
+        fallbacks = [m.strip() for m in raw_fb.split(",") if m.strip()]
+        try_order = [milestone] + [m for m in fallbacks if m != milestone]
+
+        last_resp = None
+        used_ms = milestone
+        for ms in try_order:
+            used_ms = ms
+            tags, last_resp = _fetch_tcms_distinct_tags_group(ms)
+            if tags is None and last_resp is not None:
+                try:
+                    logger.error(
+                        f"TCMS tags group failed milestone={ms} status={last_resp.status_code} "
+                        f"body={last_resp.text[:500]}"
+                    )
+                except Exception:
+                    pass
+                continue
+            if tags:
+                logger.info(f"TCMS tags (group) milestone={ms} count={len(tags)}")
+                return jsonify({"success": True, "tags": tags, "milestone": ms, "source": "group"})
+
+        # project-scan for first milestone in try_order
+        for ms in try_order:
+            tags, last_resp = _fetch_tcms_tags_project_scan(ms)
+            if tags is None and last_resp is not None and last_resp.status_code != 200:
+                try:
+                    logger.error(
+                        f"TCMS tags scan failed milestone={ms} status={last_resp.status_code} "
+                        f"body={last_resp.text[:500]}"
+                    )
+                except Exception:
+                    pass
+                continue
+            if tags:
+                logger.info(f"TCMS tags (scan) milestone={ms} count={len(tags)}")
+                return jsonify(
+                    {
+                        "success": True,
+                        "tags": tags,
+                        "milestone": ms,
+                        "source": "scan",
+                    }
+                )
+
+        if last_resp is not None and last_resp.status_code != 200:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": f"TCMS API HTTP {last_resp.status_code}",
+                        "tags": [],
+                    }
+                ),
+                502,
+            )
+
+        logger.warning(f"TCMS API returned no tags (tried: {', '.join(try_order[:6])})")
+        return jsonify(
+            {
+                "success": True,
+                "tags": [],
+                "milestone": used_ms,
+                "source": "empty",
+                "hint": "Set TCMS_MILESTONE and TCMS_API_TOKEN; check network to tcms.eng.nutanix.com",
+            }
+        )
+
+    except requests.exceptions.Timeout:
+        logger.error("TCMS API timeout (tags)")
+        return jsonify({"error": "TCMS API timeout", "success": False, "tags": []}), 504
+    except Exception as e:
+        logger.error(f"Error fetching TCMS tags: {e}", exc_info=True)
+        return jsonify({"error": str(e), "success": False, "tags": []}), 500
+
+
+@app.route("/mcp/regression/tcms/testcases", methods=["POST"])
+def fetch_tcms_testcases_by_tags():
+    """
+    Fetch testcases from TCMS API filtered by tags.
+    Body: {"tags": ["tag1", "tag2"], "milestone": "7.5.1"}
+    Returns: list of testcase names
+    """
+    try:
+        req_data = request.json or {}
+        tags = req_data.get("tags", [])
+        milestone = req_data.get("milestone", "7.5.1")
+        
+        if not tags or not isinstance(tags, list):
+            return jsonify({"error": "tags array is required"}), 400
+        
+        # Build match query for tags (test must have ALL specified tags)
+        payload = [{
+            "$match": {
+                "$and": [
+                    {"target_milestone": milestone},
+                    {"deleted": False},
+                    {"test_case.deprecated": False},
+                    {"test_case.metadata.tags": {"$all": tags}}
+                ]
+            }
+        }, {
+            "$project": {
+                "name": "$test_case.name",
+                "tags": "$test_case.metadata.tags",
+                "description": "$test_case.description"
+            }
+        }, {
+            "$sort": {"name": 1}
+        }, {
+            "$limit": 500
+        }]
+        
+        response = requests.post(
+            f"{TCMS_BASE}/milestone_all_test_cases/aggregate",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            verify=False,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("success") and data.get("data"):
+                testcases = data["data"]
+                logger.info(f"Fetched {len(testcases)} TCMS testcases for tags {tags}")
+                return jsonify({
+                    "success": True,
+                    "testcases": testcases,
+                    "count": len(testcases),
+                    "milestone": milestone,
+                    "tags": tags
+                })
+            else:
+                return jsonify({
+                    "success": True,
+                    "testcases": [],
+                    "count": 0,
+                    "milestone": milestone,
+                    "tags": tags
+                })
+        else:
+            logger.error(f"TCMS API error: HTTP {response.status_code}")
+            return jsonify({"error": f"TCMS API error: {response.status_code}"}), 502
+            
+    except requests.exceptions.Timeout:
+        logger.error("TCMS API timeout")
+        return jsonify({"error": "TCMS API timeout"}), 504
+    except Exception as e:
+        logger.error(f"Error fetching TCMS testcases: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------
 # Triage Count Endpoint
 # ---------------------------------------------------
 @app.route("/mcp/regression/triage-count", methods=["GET"])
+@jwt_required
 def get_triage_count():
     start = time.time()
     tag = request.args.get("tag")
@@ -1265,9 +1677,38 @@ def get_triage_count():
     try:
         # Reload owner mapping in case it was updated
         load_owner_mapping()
-        
-        # Fetch tasks for the tag or task IDs
-        tasks = fetch_regression_tasks(tag=tag, task_ids=task_ids)
+
+        try:
+            tasks = fetch_regression_tasks(tag=tag, task_ids=task_ids)
+        except TimeoutError as e:
+            logger.error(f"Triage count: JITA task list timeout: {e}")
+            return jsonify({
+                "error": str(e),
+                "type": "jita_timeout",
+                "tag": tag,
+                "generated_at": datetime.utcnow().isoformat(),
+                "triage_summary": {},
+                "owner_ticket_map": {},
+                "bulk_issues": {},
+                "bulk_issues_with_qi": {},
+                "pending_tests": 0,
+                "total_tests_processed": 0,
+            }), 504
+        except ConnectionError as e:
+            logger.error(f"Triage count: JITA connection error: {e}")
+            return jsonify({
+                "error": str(e),
+                "type": "jita_connection_error",
+                "tag": tag,
+                "generated_at": datetime.utcnow().isoformat(),
+                "triage_summary": {},
+                "owner_ticket_map": {},
+                "bulk_issues": {},
+                "bulk_issues_with_qi": {},
+                "pending_tests": 0,
+                "total_tests_processed": 0,
+            }), 503
+
         logger.info(f"Tasks count: {len(tasks)}")
         
         if not tasks:
@@ -1442,6 +1883,7 @@ def _config_matches_cached(cached, tag, task_ids):
 
 @app.route("/mcp/regression/triage-accuracy", methods=["GET"])
 @app.route("/api/mcp/regression/triage-accuracy", methods=["GET"])
+@jwt_required
 def get_triage_accuracy():
     """Triage Accuracy Analyzer: fetch Failed+Warning testcases, compare Jira vs Triage Genie, store in JSON."""
     start = time.time()
@@ -1621,6 +2063,7 @@ def get_triage_accuracy():
 
 @app.route("/mcp/regression/triage-accuracy/export-excel", methods=["GET"])
 @app.route("/api/mcp/regression/triage-accuracy/export-excel", methods=["GET"])
+@jwt_required
 def export_triage_accuracy_excel():
     """Export triage accuracy data as Excel file."""
     try:
@@ -1678,6 +2121,7 @@ def export_triage_accuracy_excel():
 # QI Summary Report Endpoint
 # ---------------------------------------------------
 @app.route("/mcp/regression/qi-summary", methods=["GET"])
+@jwt_required
 def get_qi_summary():
     start = time.time()
     tag = request.args.get("tag")
@@ -1864,6 +2308,161 @@ def get_qi_summary():
     except Exception as e:
         logger.error(f"Error in QI summary: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------
+# TCMS Overall QI Endpoint
+# ---------------------------------------------------
+def _resolve_tcms_milestone(branch_name):
+    """
+    Convert a full branch name (as shown in the Run Summary table) to the
+    short milestone name the TCMS API expects.
+
+    Lookup order:
+      1. Explicit entry in BRANCH_SHORT_NAME_MAP
+      2. Regex extraction of a version pattern like X.Y or X.Y.Z
+      3. Fall back to the original branch_name unchanged
+    """
+    if branch_name in BRANCH_SHORT_NAME_MAP:
+        return BRANCH_SHORT_NAME_MAP[branch_name]
+
+    version_match = re.search(r'(\d+\.\d+(?:\.\d+)?)', branch_name)
+    if version_match:
+        return version_match.group(1)
+
+    return branch_name
+
+
+@app.route("/mcp/regression/tcms-overall-qi", methods=["GET"])
+@jwt_required
+def get_tcms_overall_qi():
+    """
+    Fetch the aggregate QI (average_total_op_success_percentage) from the
+    TCMS Summary API for a given team, branch, and time filter.
+
+    Branch handling:
+      * **master** — uses team-specific filters (additional_data.team,
+        team test_sets regex, release_name exclusion, tag exclusions) and
+        ``feat_type=regression``.
+      * **release branches** (e.g. ganges-7.6-stable → milestone "7.6") —
+        uses simpler filters (test_sets regex + deprecated flag only) and
+        ``feat_type=all``.
+    """
+    start = time.time()
+    team_name = request.args.get("team_name")
+    branch_name = request.args.get("branch_name")
+    time_filter = request.args.get("time_filter", "all")
+
+    if not team_name or not branch_name:
+        return jsonify({"error": "team_name and branch_name are required"}), 400
+
+    milestone = _resolve_tcms_milestone(branch_name)
+    is_master = branch_name.lower() in ("master", "main")
+
+    logger.info(
+        f"[START] TCMS Overall QI | team={team_name} branch={branch_name} "
+        f"milestone={milestone} is_master={is_master} time_filter={time_filter}"
+    )
+
+    try:
+        if is_master:
+            # Master: team-specific filters, feat_type=regression
+            filters = json.dumps({
+                "$and": [
+                    {"test_case.test_sets": {"$regex": f"test_sets/milestones/{milestone}/", "$options": "i"}},
+                    {"release_name": {"$ne": milestone}},
+                    {"test_case.metadata.tags": {"$nin": ["SYSTEST_LONGEVITY", "LIMITED_RUNS"]}},
+                    {"additional_data.team": f"{milestone}/{team_name}"},
+                    {"test_case.test_sets": {"$regex": f"test_sets/milestones/{milestone}/{team_name}/", "$options": "i"}},
+                    {"test_case.deprecated": False},
+                ]
+            })
+            feat_type = "regression"
+        else:
+            # Release branch: simple filters, feat_type=all
+            filters = json.dumps({
+                "$and": [
+                    {"test_case.test_sets": {"$regex": f"test_sets/milestones/{milestone}/", "$options": "i"}},
+                    {"test_case.deprecated": False},
+                ]
+            })
+            feat_type = "all"
+
+        params = {
+            "aggregation_field": "target_package_type",
+            "time_filter": time_filter,
+            "target_milestone": milestone,
+            "feat_type": feat_type,
+            "filters": filters,
+        }
+
+        url = f"{TCMS_SUMMARY_BASE}/milestone_all_test_cases/aggregate/metrics"
+        response = requests.get(
+            url,
+            params=params,
+            headers={"Content-Type": "application/json"},
+            verify=False,
+            timeout=30,
+        )
+
+        if response.status_code != 200:
+            logger.error(f"TCMS Summary API returned {response.status_code}: {response.text[:500]}")
+            return jsonify({"error": f"TCMS API error: {response.status_code}"}), 502
+
+        data = response.json()
+        if not data.get("success") or not data.get("data"):
+            logger.warning("TCMS Summary API returned no data")
+            return jsonify({
+                "qi_value": None,
+                "message": "No data returned from TCMS",
+                "team_name": team_name,
+                "branch_name": branch_name,
+                "milestone": milestone,
+                "time_filter": time_filter,
+            })
+
+        overall = data["data"][0]
+        qi_value = overall.get("average_total_op_success_percentage")
+
+        logger.info(
+            f"[END] TCMS Overall QI | qi={qi_value} | time={time.time() - start:.2f}s"
+        )
+
+        return jsonify({
+            "qi_value": qi_value,
+            "team_name": team_name,
+            "branch_name": branch_name,
+            "milestone": milestone,
+            "time_filter": time_filter,
+            "total_tests": overall.get("total"),
+            "run": overall.get("run"),
+            "passed": overall.get("passed"),
+            "failed": overall.get("failed"),
+            "run_percentage": overall.get("run_percentage"),
+            "overall_effectiveness": overall.get("overall_effectiveness"),
+            "overall_stability": overall.get("overall_stability"),
+        })
+
+    except requests.exceptions.Timeout:
+        logger.error("TCMS Summary API request timed out")
+        return jsonify({"error": "TCMS API request timed out"}), 504
+    except Exception as e:
+        logger.error(f"Error fetching TCMS Overall QI: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------
+# Team Config Endpoint
+# ---------------------------------------------------
+@app.route("/mcp/regression/team-config", methods=["GET"])
+@jwt_required
+def get_team_config():
+    """Return the tag-to-team configuration and branch short-name mapping."""
+    return jsonify({
+        "team_config": TEAM_CONFIG,
+        "branch_short_names": BRANCH_SHORT_NAME_MAP,
+    })
+
 
 # ======================================================
 # Run Report - QI Analysis Endpoint
@@ -2081,6 +2680,7 @@ def generate_qi_analysis(run_folder):
         raise
 
 @app.route("/mcp/regression/run-report/list-analysis-files", methods=["POST"])
+@jwt_required
 def list_analysis_files():
     """List all analysis_*.xlsx files in a given directory"""
     try:
@@ -2234,6 +2834,7 @@ def read_existing_analysis_file(analysis_file_path):
         raise
 
 @app.route("/mcp/regression/run-report/qi-analysis", methods=["POST"])
+@jwt_required
 def qi_analysis_from_folder():
     """Generate QI analysis Excel file and extract data from it, or read from existing file"""
     try:
@@ -2284,6 +2885,7 @@ def qi_analysis_from_folder():
 # Run Report - Email Endpoints
 # ======================================================
 @app.route("/mcp/regression/run-report/preview-email", methods=["POST"])
+@jwt_required
 def preview_qi_bug_email():
     """Generate email preview for Top QI Impacting Bugs"""
     try:
@@ -2431,6 +3033,7 @@ Run Folder: {run_folder}
         return jsonify({"error": str(e)}), 500
 
 @app.route("/mcp/regression/run-report/send-email", methods=["POST"])
+@jwt_required
 def send_qi_bug_email():
     """Send email for Top QI Impacting Bugs"""
     try:
@@ -2708,6 +3311,7 @@ def update_job_profiles_tester_tags(job_profile_ids, tag_name, action="add"):
     return updated_count, failed_updates
 
 @app.route("/mcp/regression/run-plan", methods=["GET"])
+@jwt_required
 def list_run_plans():
     """List all run plans"""
     try:
@@ -2718,6 +3322,7 @@ def list_run_plans():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/mcp/regression/run-plan", methods=["POST"])
+@jwt_required
 def create_run_plan():
     """Create a new run plan"""
     try:
@@ -2774,6 +3379,7 @@ def create_run_plan():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/mcp/regression/run-plan/<run_plan_id>", methods=["PUT"])
+@jwt_required
 def update_run_plan(run_plan_id):
     """Update an existing run plan"""
     try:
@@ -2834,6 +3440,7 @@ def update_run_plan(run_plan_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route("/mcp/regression/run-plan/search-job-profiles", methods=["POST"])
+@jwt_required
 def search_job_profiles():
     """Search job profiles by ID or pattern"""
     try:
@@ -2888,6 +3495,7 @@ def search_job_profiles():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/mcp/regression/run-plan/<run_plan_id>/trigger", methods=["POST"])
+@jwt_required
 def trigger_run_plan(run_plan_id):
     """Trigger a run plan now"""
     try:
@@ -3063,6 +3671,7 @@ def trigger_run_plan(run_plan_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route("/mcp/regression/run-plan/<run_plan_id>/batch-update", methods=["POST"])
+@jwt_required
 def batch_update_job_profiles(run_plan_id):
     """Batch update job profiles in a run plan"""
     try:
@@ -3367,6 +3976,7 @@ def batch_update_job_profiles(run_plan_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route("/mcp/regression/run-plan/<run_plan_id>/history", methods=["GET"])
+@jwt_required
 def get_run_plan_history(run_plan_id):
     """Get history for a run plan"""
     try:
@@ -3383,6 +3993,7 @@ def get_run_plan_history(run_plan_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route("/mcp/regression/run-plan/history/<history_id>/retry", methods=["POST"])
+@jwt_required
 def retry_history_entry(history_id):
     """Retry a history entry trigger"""
     try:
@@ -3406,6 +4017,7 @@ def retry_history_entry(history_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route("/mcp/regression/run-plan/history/<history_id>", methods=["DELETE"])
+@jwt_required
 def delete_history_entry(history_id):
     """Delete a history entry"""
     try:
@@ -3424,6 +4036,7 @@ def delete_history_entry(history_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route("/mcp/regression/run-plan/<run_plan_id>/clone", methods=["POST"])
+@jwt_required
 def clone_run_plan(run_plan_id):
     """Clone a run plan with a new unique tag_name"""
     try:
@@ -3491,6 +4104,7 @@ def clone_run_plan(run_plan_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route("/mcp/regression/run-plan/<run_plan_id>", methods=["DELETE"])
+@jwt_required
 def delete_run_plan(run_plan_id):
     """Delete a run plan and all its associated history entries"""
     try:
@@ -3527,6 +4141,7 @@ def delete_run_plan(run_plan_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route("/mcp/regression/run-plan/<run_plan_id>/delete-tag", methods=["POST"])
+@jwt_required
 def delete_tag_from_job_profiles(run_plan_id):
     """Delete a tag from tester_tags of all job profiles in a run plan"""
     try:
@@ -3569,6 +4184,7 @@ def delete_tag_from_job_profiles(run_plan_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route("/mcp/regression/run-plan/tags", methods=["GET"])
+@jwt_required
 def get_available_tags():
     """Get list of available tags from JITA"""
     try:
@@ -3607,6 +4223,7 @@ def get_available_tags():
 # Triage Genie Endpoints
 # ======================================================
 @app.route("/mcp/regression/triage-genie/jobs", methods=["GET"])
+@jwt_required
 def list_triage_genie_jobs():
     """List all Triage Genie jobs - primarily from JSON file"""
     try:
@@ -3669,6 +4286,7 @@ def list_triage_genie_jobs():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/mcp/regression/triage-genie/jobs", methods=["POST"])
+@jwt_required
 def create_triage_genie_job():
     """Create a new Triage Genie job"""
     try:
@@ -4361,6 +4979,7 @@ def fetch_triage_genie_ticket_id(agave_task_id, triage_session=None):
         return None
 
 @app.route("/mcp/regression/failed-analysis/analyze", methods=["GET"])
+@jwt_required
 def analyze_failed_testcases():
     """Analyze failed testcases with AI agent"""
     start = time.time()
@@ -4714,6 +5333,7 @@ def _analyze_failed_testcases_stream(tag, task_ids, include_set):
 
 
 @app.route("/mcp/regression/failed-analysis/analyze-stream", methods=["GET"])
+@jwt_required
 def analyze_failed_testcases_stream():
     """Stream analysis results as Server-Sent Events so the UI can display rows as they load."""
     tag = request.args.get("tag")
@@ -4740,6 +5360,7 @@ def analyze_failed_testcases_stream():
 
 
 @app.route("/mcp/regression/failed-analysis/update-triage", methods=["PUT"])
+@jwt_required
 def update_triage_comments():
     """Update comment and/or jira_ticket for an agave_test_result via JITA PUT API."""
     try:
@@ -4813,6 +5434,7 @@ def _fetch_test_result_for_task_and_name(task_id, test_name):
 
 
 @app.route("/mcp/regression/failed-analysis/history", methods=["GET"])
+@jwt_required
 def failed_analysis_history():
     """Return past 3 runs for a test on same or other branch. For each run: status, jira_ticket or comment."""
     test_name = request.args.get("test_name")
@@ -4850,6 +5472,2852 @@ def failed_analysis_history():
     except Exception as e:
         logger.error(f"Error fetching history: {e}", exc_info=True)
         return jsonify({"error": str(e), "runs": []}), 500
+
+
+# ======================================================
+# Testcase Management
+# ======================================================
+
+TESTCASE_MGMT_BRANCHES = {
+    "master": {"milestone": "master", "team_prefix": "master", "test_set_regex": "test_sets/milestones/master/"},
+    "ganges-7.6-stable": {"milestone": "7.6", "team_prefix": "7.6", "test_set_regex": "test_sets/milestones/7.6/"},
+    "ganges-7.5-stable": {"milestone": "7.5", "team_prefix": "7.5", "test_set_regex": "test_sets/milestones/7.5/"},
+}
+
+TESTCASE_MGMT_TEAMS = ["CDP", "AHV"]
+
+
+def _tcms_auth():
+    return (TCMS_USER, TCMS_PASSWORD)
+
+
+def _build_aggregate_payload(milestone, team_prefix, team, test_set_regex, skip, limit):
+    """Build the MongoDB aggregation pipeline payload for the POST API."""
+    return json.dumps([
+        {"$match": {"$and": [
+            {
+                "target_milestone": milestone,
+                "last_result": {"$elemMatch": {"pass_name": "overall"}},
+                "deleted": False,
+            },
+            {"test_case.test_sets": {"$regex": test_set_regex, "$options": "i"}},
+            {"additional_data.team": f"{team_prefix}/{team}"},
+            {"release_name": {"$ne": milestone}},
+            {"test_case.metadata.tags": {"$nin": ["SYSTEST_LONGEVITY", "LIMITED_RUNS"]}},
+            {"test_case.deprecated": False},
+        ]}},
+        {"$sort": {"name": 1}},
+        {"$skip": skip},
+        {"$limit": limit},
+    ])
+
+
+def _normalize_testcase(item):
+    """Extract a flat dict from a raw TCMS milestone_all_test_cases record."""
+    tc = item.get("test_case", {})
+    meta = tc.get("metadata", {})
+    ad = item.get("additional_data", {})
+    score = item.get("test_score", {})
+
+    last_result_list = item.get("last_result", [])
+    last_status = ""
+    is_triaged = False
+    issue_type = ""
+    last_run_tickets = []
+    last_run_date = None
+    last_passed_date = None
+    if isinstance(last_result_list, list) and last_result_list:
+        entry = last_result_list[0]
+        run_info = entry.get("run", {})
+        last_status = run_info.get("status", "")
+        is_triaged = run_info.get("is_triaged", False)
+        issue_type = run_info.get("issue_type", "")
+        last_run_tickets = run_info.get("tickets", [])
+        run_start = run_info.get("start_time", {})
+        if isinstance(run_start, dict) and "$date" in run_start:
+            last_run_date = datetime.utcfromtimestamp(run_start["$date"] / 1000).strftime("%Y-%m-%d %H:%M")
+        succeeded_info = entry.get("succeeded", {})
+        if isinstance(succeeded_info, dict) and succeeded_info:
+            succ_start = succeeded_info.get("start_time", {})
+            if isinstance(succ_start, dict) and "$date" in succ_start:
+                last_passed_date = datetime.utcfromtimestamp(succ_start["$date"] / 1000).strftime("%Y-%m-%d %H:%M")
+
+    published_qi = None
+    published_success_ops = None
+    published_total_ops = None
+    if isinstance(last_result_list, list) and last_result_list:
+        published_info = last_result_list[0].get("published", {})
+        if isinstance(published_info, dict) and published_info:
+            published_qi = published_info.get("operation_success_percentage")
+            published_success_ops = published_info.get("successful_operations")
+            published_total_ops = published_info.get("total_operations")
+
+    ect = item.get("execution_cycle_time", {})
+    automated_date_raw = ad.get("automated_date", {})
+    automated_date = None
+    if isinstance(automated_date_raw, dict) and "$date" in automated_date_raw:
+        automated_date = datetime.utcfromtimestamp(automated_date_raw["$date"] / 1000).strftime("%Y-%m-%d")
+
+    return {
+        "oid": (item.get("_id", {}).get("$oid", "") if isinstance(item.get("_id"), dict) else ""),
+        "name": item.get("name", ""),
+        "path": tc.get("path", ""),
+        "owners": tc.get("owners", []),
+        "priority": meta.get("priority", ""),
+        "summary": meta.get("summary", ""),
+        "components": meta.get("components", []),
+        "primary_component": meta.get("primary_component", ""),
+        "services": meta.get("services", []),
+        "tags": [],
+        "metadata_tags": meta.get("tags", []),
+        "test_sets": tc.get("test_sets", []),
+        "team": ad.get("team", []),
+        "target_service": item.get("target_service", ""),
+        "target": item.get("target", ""),
+        "framework": tc.get("framework", ""),
+        "last_status": last_status,
+        "last_run_date": last_run_date,
+        "last_passed_date": last_passed_date,
+        "is_triaged": is_triaged,
+        "issue_type": issue_type,
+        "last_run_tickets": last_run_tickets,
+        "success_percentage": ad.get("success_percentage"),
+        "avg_run_duration": ad.get("avg_run_duration"),
+        "automated_date": automated_date,
+        "one_month_mttr": ect.get("one_month_mttr"),
+        "three_months_mttr": ect.get("three_months_mttr"),
+        "published_qi": published_qi,
+        "published_success_ops": published_success_ops,
+        "published_total_ops": published_total_ops,
+        "stability": score.get("stability"),
+        "effectiveness": score.get("effectiveness"),
+        "total_results": score.get("total_results"),
+        "tickets": item.get("tickets", []),
+        "resource_spec": tc.get("resource_spec", []),
+    }
+
+
+def _fetch_tags_for_testcases(testcases, branch_key):
+    """Batch-fetch tags from the GET all_test_cases API using regex matching."""
+    if not testcases:
+        return testcases
+
+    name_map = {tc["name"]: tc for tc in testcases}
+    target_branch = branch_key
+
+    batch_size = 50
+    names = list(name_map.keys())
+
+    def _fetch_batch(batch_names):
+        for tc_name in batch_names:
+            try:
+                raw_query = json.dumps({
+                    "$and": [
+                        {
+                            "target_service": "NutestPy3Tests",
+                            "target_branch": target_branch,
+                            "target_package_type": "tar",
+                            "deleted": False,
+                        },
+                        {"test_case.name": tc_name},
+                        {"test_case.deprecated": False},
+                    ]
+                })
+                url = (
+                    f"{TCMS_TESTDB_BASE}/all_test_cases"
+                    f"?raw_query={urllib.parse.quote(raw_query)}&sort=name&limit=1"
+                )
+                resp = requests.get(url, auth=_tcms_auth(), verify=False, timeout=30)
+                if resp.status_code == 200:
+                    data = resp.json().get("data", [])
+                    if data:
+                        tags = data[0].get("additional_data", {}).get("tags", [])
+                        if tc_name in name_map:
+                            name_map[tc_name]["tags"] = tags
+            except Exception as exc:
+                logger.warning(f"Failed to fetch tags for {tc_name}: {exc}")
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        for i in range(0, len(names), batch_size):
+            batch = names[i:i + batch_size]
+            pool.submit(_fetch_batch, batch)
+
+    return testcases
+
+
+def _tc_data_file(branch, team):
+    """Return the path for a per-branch/team JSON file."""
+    safe_name = f"testcase_management_{branch}_{team}.json".replace("/", "_")
+    return os.path.join(TESTCASE_MGMT_DATA_DIR, safe_name)
+
+
+def _load_tc_data(branch, team):
+    fpath = _tc_data_file(branch, team)
+    try:
+        with open(fpath, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"last_updated": None, "branch": branch, "team": team, "testcases": []}
+
+
+def _save_tc_data(branch, team, data):
+    os.makedirs(TESTCASE_MGMT_DATA_DIR, exist_ok=True)
+    fpath = _tc_data_file(branch, team)
+    with open(fpath, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+
+
+@app.route("/mcp/regression/testcase-mgmt/fetch-data", methods=["GET"])
+@jwt_required
+def testcase_mgmt_fetch_data():
+    """Fetch all test cases from TCMS for a given branch/team and persist to JSON."""
+    branch = request.args.get("branch", "master")
+    team = request.args.get("team", "CDP")
+    page_limit = 500
+
+    branch_cfg = TESTCASE_MGMT_BRANCHES.get(branch)
+    if not branch_cfg:
+        return jsonify({"error": f"Unknown branch: {branch}"}), 400
+
+    milestone = branch_cfg["milestone"]
+    team_prefix = branch_cfg["team_prefix"]
+    test_set_regex = branch_cfg["test_set_regex"]
+
+    all_testcases = []
+    skip = 0
+
+    try:
+        while True:
+            payload = _build_aggregate_payload(milestone, team_prefix, team, test_set_regex, skip, page_limit)
+            resp = requests.post(
+                f"{TCMS_BASE}/milestone_all_test_cases/aggregate",
+                data=payload,
+                auth=_tcms_auth(),
+                verify=False,
+                timeout=120,
+                headers={"Content-Type": "application/json"},
+            )
+            if resp.status_code != 200:
+                logger.error(f"TCMS aggregate API returned {resp.status_code}: {resp.text[:500]}")
+                break
+
+            batch = resp.json().get("data", [])
+            if not batch:
+                break
+
+            for item in batch:
+                all_testcases.append(_normalize_testcase(item))
+
+            logger.info(f"Fetched {len(batch)} testcases (skip={skip}) for {branch}/{team}")
+            if len(batch) < page_limit:
+                break
+            skip += page_limit
+
+        logger.info(f"Total testcases fetched from aggregate API: {len(all_testcases)} for {branch}/{team}")
+
+        _fetch_tags_for_testcases(all_testcases, branch)
+
+        now = datetime.utcnow().isoformat() + "Z"
+        data = {
+            "last_updated": now,
+            "branch": branch,
+            "team": team,
+            "testcases": all_testcases,
+        }
+        _save_tc_data(branch, team, data)
+
+        return jsonify({
+            "status": "ok",
+            "branch": branch,
+            "team": team,
+            "count": len(all_testcases),
+            "last_updated": now,
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching testcase data: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/mcp/regression/testcase-mgmt/testcases", methods=["GET"])
+@jwt_required
+def testcase_mgmt_get_testcases():
+    """Return testcases from local JSON with optional filters."""
+    branch = request.args.get("branch", "master")
+    team = request.args.get("team", "CDP")
+    tag_filter = request.args.get("tags", "")
+    name_filter = request.args.get("name", "").lower()
+    status_filter = request.args.get("status", "")
+
+    data = _load_tc_data(branch, team)
+    all_testcases = data.get("testcases", [])
+    testcases = list(all_testcases)
+
+    if tag_filter:
+        filter_tags = [t.strip().lower() for t in tag_filter.split(",") if t.strip()]
+        testcases = [
+            tc for tc in testcases
+            if any(ft in [t.lower() for t in tc.get("tags", [])] for ft in filter_tags)
+        ]
+
+    if name_filter:
+        testcases = [tc for tc in testcases if name_filter in tc.get("name", "").lower()]
+
+    if status_filter:
+        testcases = [tc for tc in testcases if tc.get("last_status", "").lower() == status_filter.lower()]
+
+    all_tags = set()
+    for tc in all_testcases:
+        for t in tc.get("tags", []):
+            all_tags.add(t)
+
+    return jsonify({
+        "branch": branch,
+        "team": team,
+        "count": len(testcases),
+        "total_count": len(all_testcases),
+        "last_updated": data.get("last_updated"),
+        "available_tags": sorted(all_tags),
+        "testcases": testcases,
+    })
+
+
+@app.route("/mcp/regression/testcase-mgmt/tags/add", methods=["POST"])
+@jwt_required
+def testcase_mgmt_add_tags():
+    """Add tags to selected test cases via TCMS write API."""
+    body = request.get_json(force=True)
+    testcase_oids = body.get("testcase_oids", [])
+    tags_to_add = body.get("tags", [])
+    branch = body.get("branch", "master")
+    team = body.get("team", "CDP")
+
+    if not testcase_oids or not tags_to_add:
+        return jsonify({"error": "testcase_oids and tags are required"}), 400
+
+    results = {"success": 0, "failed": 0, "errors": []}
+
+    for oid in testcase_oids:
+        try:
+            url = f"{TCMS_WRITE_BASE}/all_test_cases/tags/{oid}"
+            resp = requests.post(
+                url,
+                auth=_tcms_auth(),
+                data=json.dumps({"tags": tags_to_add}),
+                verify=False,
+                timeout=30,
+            )
+            if resp.status_code in (200, 201):
+                results["success"] += 1
+            else:
+                results["failed"] += 1
+                results["errors"].append({"oid": oid, "status": resp.status_code})
+        except Exception as exc:
+            results["failed"] += 1
+            results["errors"].append({"oid": oid, "error": str(exc)})
+
+    data = _load_tc_data(branch, team)
+    for tc in data.get("testcases", []):
+        if tc.get("oid") in testcase_oids:
+            existing = tc.get("tags", [])
+            for tag in tags_to_add:
+                if tag not in existing:
+                    existing.append(tag)
+            tc["tags"] = existing
+    data["last_updated"] = datetime.utcnow().isoformat() + "Z"
+    _save_tc_data(branch, team, data)
+
+    return jsonify(results)
+
+
+@app.route("/mcp/regression/testcase-mgmt/tags/delete", methods=["POST"])
+@jwt_required
+def testcase_mgmt_delete_tags():
+    """Delete tags from selected test cases via TCMS write API."""
+    body = request.get_json(force=True)
+    testcase_oids = body.get("testcase_oids", [])
+    tags_to_delete = body.get("tags", [])
+    branch = body.get("branch", "master")
+    team = body.get("team", "CDP")
+
+    if not testcase_oids or not tags_to_delete:
+        return jsonify({"error": "testcase_oids and tags are required"}), 400
+
+    results = {"success": 0, "failed": 0, "errors": []}
+
+    for oid in testcase_oids:
+        try:
+            url = f"{TCMS_WRITE_BASE}/all_test_cases/tags/{oid}"
+            resp = requests.delete(
+                url,
+                auth=_tcms_auth(),
+                data=json.dumps({"tags": tags_to_delete}),
+                verify=False,
+                timeout=30,
+            )
+            if resp.status_code in (200, 204):
+                results["success"] += 1
+            else:
+                results["failed"] += 1
+                results["errors"].append({"oid": oid, "status": resp.status_code})
+        except Exception as exc:
+            results["failed"] += 1
+            results["errors"].append({"oid": oid, "error": str(exc)})
+
+    data = _load_tc_data(branch, team)
+    for tc in data.get("testcases", []):
+        if tc.get("oid") in testcase_oids:
+            tc["tags"] = [t for t in tc.get("tags", []) if t not in tags_to_delete]
+    data["last_updated"] = datetime.utcnow().isoformat() + "Z"
+    _save_tc_data(branch, team, data)
+
+    return jsonify(results)
+
+
+@app.route("/mcp/regression/testcase-mgmt/resource-spec/download", methods=["GET"])
+@jwt_required
+def testcase_mgmt_resource_spec_download():
+    """Generate an Excel workbook grouping test cases by unique resource_spec."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    branch = request.args.get("branch", "master")
+    team = request.args.get("team", "CDP")
+    data = _load_tc_data(branch, team)
+    testcases = data.get("testcases", [])
+
+    if not testcases:
+        return jsonify({"error": "No testcase data found. Reload from TCMS first."}), 404
+
+    def _spec_fingerprint(spec_list):
+        """Canonical string key for grouping (ignores resource 'name')."""
+        cleaned = []
+        for item in (spec_list or []):
+            entry = {k: v for k, v in sorted(item.items()) if k != "name"}
+            cleaned.append(json.dumps(entry, sort_keys=True))
+        return "|".join(sorted(cleaned))
+
+    def _format_resource(r):
+        """Return a multi-line human-readable string for one resource item."""
+        lines = []
+        lines.append(f"name: {r.get('name', '—')}")
+        lines.append(f"type: {r.get('type', '—')}")
+        hw = r.get("hardware", {})
+        if hw:
+            lines.append(f"min_host_gb_ram: {hw.get('min_host_gb_ram', '—')}")
+            lines.append(f"min_host_cpu_cores: {hw.get('min_host_cpu_cores', '—')}")
+            lines.append(f"cluster_min_nodes: {hw.get('cluster_min_nodes', r.get('cluster_min_nodes', '—'))}")
+        elif "cluster_min_nodes" in r:
+            lines.append(f"cluster_min_nodes: {r['cluster_min_nodes']}")
+        sc = r.get("scaleout", {})
+        if sc:
+            lines.append(f"scaleout.num_instances: {sc.get('num_instances', '—')}")
+        deps = r.get("dependencies")
+        if deps:
+            lines.append(f"dependencies: {', '.join(deps)}")
+        prov = r.get("provider")
+        if isinstance(prov, dict):
+            lines.append(f"provider.host: {prov.get('host', '—')}")
+        can_run = r.get("can_run_on_provider")
+        if can_run:
+            lines.append(f"can_run_on_provider: {', '.join(can_run) if isinstance(can_run, list) else can_run}")
+        for k, v in sorted(r.items()):
+            if k not in ("name", "type", "hardware", "cluster_min_nodes", "scaleout",
+                         "dependencies", "provider", "can_run_on_provider"):
+                lines.append(f"{k}: {json.dumps(v) if isinstance(v, (dict, list)) else v}")
+        return "\n".join(lines)
+
+    def _format_spec_full(spec_list):
+        """Return the full resource_spec as readable text (all resources)."""
+        if not spec_list:
+            return "None"
+        blocks = []
+        for idx, r in enumerate(spec_list, 1):
+            blocks.append(f"[Resource {idx}]\n{_format_resource(r)}")
+        return "\n\n".join(blocks)
+
+    groups = defaultdict(list)
+    for tc in testcases:
+        key = _spec_fingerprint(tc.get("resource_spec", []))
+        groups[key].append(tc)
+    key_to_id = {}
+    for idx, key in enumerate(sorted(groups.keys(), key=lambda k: -len(groups[k])), 1):
+        key_to_id[key] = idx
+
+    wb = Workbook()
+    hdr_font = Font(bold=True, color="FFFFFF", size=11)
+    hdr_fill = PatternFill(start_color="34495E", end_color="34495E", fill_type="solid")
+    grp_fill = PatternFill(start_color="EAF2F8", end_color="EAF2F8", fill_type="solid")
+    thin = Border(left=Side(style="thin"), right=Side(style="thin"),
+                  top=Side(style="thin"), bottom=Side(style="thin"))
+    wrap = Alignment(wrap_text=True, vertical="top")
+
+    def _write_header(ws, headers):
+        for ci, h in enumerate(headers, 1):
+            c = ws.cell(row=1, column=ci, value=h)
+            c.font = hdr_font
+            c.fill = hdr_fill
+            c.alignment = wrap
+            c.border = thin
+
+    # ── Sheet 1: Testcases ──
+    ws1 = wb.active
+    ws1.title = "Testcases"
+    _write_header(ws1, ["Testcase Name", "Resource Spec", "Group ID"])
+
+    row = 2
+    for tc in sorted(testcases, key=lambda t: key_to_id.get(_spec_fingerprint(t.get("resource_spec", [])), 0)):
+        spec = tc.get("resource_spec", [])
+        gid = key_to_id.get(_spec_fingerprint(spec), 0)
+        ws1.cell(row=row, column=1, value=tc.get("name", "")).border = thin
+        ws1.cell(row=row, column=1).alignment = wrap
+        c_spec = ws1.cell(row=row, column=2, value=_format_spec_full(spec))
+        c_spec.border = thin
+        c_spec.alignment = wrap
+        c_gid = ws1.cell(row=row, column=3, value=gid)
+        c_gid.border = thin
+        c_gid.alignment = Alignment(horizontal="center", vertical="top")
+        row += 1
+
+    ws1.column_dimensions["A"].width = 80
+    ws1.column_dimensions["B"].width = 70
+    ws1.column_dimensions["C"].width = 12
+
+    # ── Sheet 2: Grouped Resource Specs ──
+    ws2 = wb.create_sheet("Grouped Resource Specs")
+    _write_header(ws2, ["Group ID", "Testcase Count", "Resource Spec", "Testcase Names"])
+
+    sorted_groups = sorted(key_to_id.items(), key=lambda kv: kv[1])
+    for key, gid in sorted_groups:
+        tcs = groups[key]
+        spec_list = tcs[0].get("resource_spec", [])
+        r = gid + 1
+        ws2.cell(row=r, column=1, value=gid).border = thin
+        ws2.cell(row=r, column=1).alignment = Alignment(horizontal="center", vertical="top")
+        ws2.cell(row=r, column=2, value=len(tcs)).border = thin
+        ws2.cell(row=r, column=2).alignment = Alignment(horizontal="center", vertical="top")
+        c_spec = ws2.cell(row=r, column=3, value=_format_spec_full(spec_list))
+        c_spec.border = thin
+        c_spec.alignment = wrap
+        tc_names = "\n".join(t.get("name", "") for t in tcs)
+        c_names = ws2.cell(row=r, column=4, value=tc_names)
+        c_names.border = thin
+        c_names.alignment = wrap
+
+    ws2.column_dimensions["A"].width = 12
+    ws2.column_dimensions["B"].width = 14
+    ws2.column_dimensions["C"].width = 70
+    ws2.column_dimensions["D"].width = 80
+
+    # ── Sheet 3: Resource Spec Detail (flat table) ──
+    ws3 = wb.create_sheet("Resource Detail")
+    detail_headers = [
+        "Group ID", "Resource #", "name", "type",
+        "min_host_gb_ram", "min_host_cpu_cores", "cluster_min_nodes",
+        "scaleout.num_instances", "dependencies", "provider.host",
+        "Extra Parameters",
+    ]
+    _write_header(ws3, detail_headers)
+    KNOWN_KEYS = {"name", "type", "hardware", "cluster_min_nodes", "scaleout",
+                  "dependencies", "provider", "can_run_on_provider", "can_run_on_hardware"}
+
+    dr = 2
+    for key, gid in sorted_groups:
+        tcs = groups[key]
+        spec_list = tcs[0].get("resource_spec", [])
+        for ri, res in enumerate(spec_list, 1):
+            hw = res.get("hardware", {})
+            extras = {k: v for k, v in res.items() if k not in KNOWN_KEYS}
+            extra_str = "; ".join(f"{k}={json.dumps(v) if isinstance(v, (dict, list)) else v}"
+                                  for k, v in sorted(extras.items())) if extras else ""
+            vals = [
+                gid,
+                ri,
+                res.get("name", ""),
+                res.get("type", ""),
+                hw.get("min_host_gb_ram", ""),
+                hw.get("min_host_cpu_cores", ""),
+                hw.get("cluster_min_nodes", res.get("cluster_min_nodes", "")),
+                (res.get("scaleout") or {}).get("num_instances", ""),
+                ", ".join(res.get("dependencies", [])) if res.get("dependencies") else "",
+                (res.get("provider") or {}).get("host", "") if isinstance(res.get("provider"), dict) else "",
+                extra_str,
+            ]
+            for ci, v in enumerate(vals, 1):
+                c = ws3.cell(row=dr, column=ci, value=v)
+                c.border = thin
+                c.alignment = wrap
+            if ri == 1:
+                for ci in range(1, len(vals) + 1):
+                    ws3.cell(row=dr, column=ci).fill = grp_fill
+            dr += 1
+
+    ws3.column_dimensions["A"].width = 10
+    ws3.column_dimensions["B"].width = 12
+    ws3.column_dimensions["C"].width = 22
+    ws3.column_dimensions["D"].width = 18
+    ws3.column_dimensions["E"].width = 16
+    ws3.column_dimensions["F"].width = 18
+    ws3.column_dimensions["G"].width = 18
+    ws3.column_dimensions["H"].width = 20
+    ws3.column_dimensions["I"].width = 30
+    ws3.column_dimensions["J"].width = 20
+    ws3.column_dimensions["K"].width = 40
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    filename = f"resource_spec_{branch}_{team}.xlsx"
+    return send_file(buf, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                     as_attachment=True, download_name=filename)
+
+
+@app.route("/mcp/regression/testcase-mgmt/resolve-job-profiles", methods=["POST"])
+@jwt_required
+def testcase_mgmt_resolve_job_profiles():
+    """Search JITA job profiles by prefix and cross-reference with testcase test_sets."""
+    from urllib.parse import quote
+
+    body = request.get_json(force=True)
+    branch = body.get("branch", "master")
+    team = body.get("team", "CDP")
+    jp_prefix = body.get("jp_prefix", "").strip()
+    tc_names = body.get("testcase_names", [])
+
+    if not jp_prefix:
+        return jsonify({"error": "jp_prefix is required"}), 400
+
+    data = _load_tc_data(branch, team)
+    all_tcs = data.get("testcases", [])
+
+    if tc_names:
+        name_set = set(tc_names)
+        target_tcs = [tc for tc in all_tcs if tc.get("name") in name_set]
+    else:
+        target_tcs = all_tcs
+
+    if not target_tcs:
+        return jsonify({"error": "No matching testcases found"}), 404
+
+    raw_query = json.dumps({"name": {"$regex": f"^{jp_prefix}", "$options": "i"}})
+    try:
+        resp = requests.get(
+            f"{JITA_BASE}/job_profiles",
+            params={"raw_query": quote(raw_query), "limit": 200},
+            auth=JITA_SVC_AUTH,
+            verify=False,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        job_profiles = resp.json().get("data", [])
+    except Exception as exc:
+        return jsonify({"error": f"JITA search failed: {exc}"}), 502
+
+    if not job_profiles:
+        return jsonify({
+            "matched": [],
+            "unmatched_testcases": [tc.get("name", "") for tc in target_tcs],
+            "total_matched_testcases": 0,
+            "total_unmatched_testcases": len(target_tcs),
+            "job_profiles_found": 0,
+        })
+
+    jp_map = {}
+    for jp in job_profiles:
+        jp_id = jp.get("_id", {}).get("$oid", "") if isinstance(jp.get("_id"), dict) else str(jp.get("_id", ""))
+        jp_name = jp.get("name", "")
+        jp_test_sets = set()
+        for ts in jp.get("test_sets", jp.get("test_set", [])):
+            if isinstance(ts, str):
+                jp_test_sets.add(ts.lower())
+            elif isinstance(ts, dict):
+                ts_name = ts.get("name", ts.get("test_set", ""))
+                if ts_name:
+                    jp_test_sets.add(str(ts_name).lower())
+        jp_map[jp_id] = {"name": jp_name, "test_sets": jp_test_sets, "testcases": []}
+
+    matched_tc_names = set()
+    for tc in target_tcs:
+        tc_test_sets = {s.lower() for s in tc.get("test_sets", []) if isinstance(s, str)}
+        for jp_id, jp_info in jp_map.items():
+            if tc_test_sets & jp_info["test_sets"]:
+                jp_info["testcases"].append(tc.get("name", ""))
+                matched_tc_names.add(tc.get("name", ""))
+
+    matched = []
+    for jp_id, jp_info in jp_map.items():
+        if jp_info["testcases"]:
+            matched.append({
+                "job_profile_id": jp_id,
+                "job_profile_name": jp_info["name"],
+                "testcase_count": len(jp_info["testcases"]),
+                "testcases": jp_info["testcases"],
+            })
+    matched.sort(key=lambda x: -x["testcase_count"])
+
+    unmatched = [tc.get("name", "") for tc in target_tcs if tc.get("name", "") not in matched_tc_names]
+
+    return jsonify({
+        "matched": matched,
+        "unmatched_testcases": unmatched,
+        "total_matched_testcases": len(matched_tc_names),
+        "total_unmatched_testcases": len(unmatched),
+        "job_profiles_found": len(job_profiles),
+    })
+
+
+@app.route("/mcp/regression/testcase-mgmt/branches", methods=["GET"])
+@jwt_required
+def testcase_mgmt_branches():
+    """Return available branches and teams for the testcase management module."""
+    return jsonify({
+        "branches": list(TESTCASE_MGMT_BRANCHES.keys()),
+        "teams": TESTCASE_MGMT_TEAMS,
+    })
+# Dynamic Job Profile APIs
+# ======================================================
+
+@app.route("/mcp/regression/dynamic-jp/test-execution-history", methods=["POST"])
+def dynamic_jp_test_execution_history():
+    """Fetch detailed test execution history from JITA.
+
+    Mirrors JITA /test_history: each row is one execution. When ``branch`` is set in
+    the JSON body, results are restricted to that ``system_under_test.branch`` (query
+    + case-insensitive post-filter). ``test_set`` and ``job_profile`` come from the
+    **history row** (``test_set`` / ``test_set_name`` / ``AgaveTask`` and run
+    ``label`` for JP), with task lookups only as fallback.
+    """
+    try:
+        req_data = request.json or {}
+        test_name = (req_data.get("test_name") or "").strip()
+        page = int(req_data.get("page", 1))
+        limit = int(req_data.get("limit", 50))
+        sort_field = req_data.get("sort", "-start_time")
+        branch_filter = (req_data.get("branch") or "").strip()
+
+        if not test_name:
+            return jsonify({"error": "test_name is required"}), 400
+
+        raw_query = {"test.name": test_name}
+        if branch_filter:
+            raw_query["system_under_test.branch"] = branch_filter
+
+        start = max(0, limit * (page - 1))
+        raw_items = []
+        total = 0
+
+        logger.info(f"[test-exec-history] Querying: test.name={test_name}, page={page}")
+
+        # Primary: GET agave_test_results (mirrors JITA frontend)
+        try:
+            params = {
+                "start": start,
+                "limit": limit,
+                "sort": sort_field,
+                "raw_query": json.dumps(raw_query),
+            }
+            resp = requests.get(
+                f"{JITA_BASE}/agave_test_results",
+                params=params,
+                auth=JITA_SVC_AUTH,
+                verify=False,
+                timeout=90,
+            )
+            if resp.status_code == 200:
+                jita_data = resp.json()
+                raw_items = jita_data.get("data", [])
+                total = jita_data.get("total", 0)
+                logger.info(f"[test-exec-history] GET returned {total} total, {len(raw_items)} items")
+        except requests.exceptions.Timeout:
+            logger.warning("[test-exec-history] GET timed out, trying POST fallback")
+        except Exception as e:
+            logger.warning(f"[test-exec-history] GET failed: {e}")
+
+        # Fallback: POST reports/agave_test_results
+        if not raw_items:
+            try:
+                payload = {
+                    "raw_query": raw_query,
+                    "start": start,
+                    "limit": limit,
+                    "sort": sort_field,
+                }
+                resp2 = requests.post(
+                    f"{JITA_BASE}/reports/agave_test_results",
+                    json=payload,
+                    auth=JITA_SVC_AUTH,
+                    verify=False,
+                    timeout=90,
+                )
+                if resp2.status_code == 200:
+                    data2 = resp2.json()
+                    raw_items = data2.get("data", [])
+                    total = data2.get("total", data2.get("metadata", {}).get("total", 0))
+                    logger.info(f"[test-exec-history] POST returned {total} total, {len(raw_items)} items")
+            except requests.exceptions.Timeout:
+                logger.warning("[test-exec-history] POST also timed out")
+            except Exception as e:
+                logger.warning(f"[test-exec-history] POST fallback failed: {e}")
+
+        jita_total_pre_branch = total
+
+        def _sut_branch(item):
+            return (item.get("system_under_test") or {}).get("branch") or ""
+
+        def _branch_matches(item):
+            if not branch_filter:
+                return True
+            return (_sut_branch(item) or "").strip().lower() == branch_filter.lower()
+
+        # Match UI: use history rows for the selected branch (backup if JITA query is loose)
+        if branch_filter:
+            raw_items = [it for it in raw_items if _branch_matches(it)]
+            total = len(raw_items)
+            logger.info(
+                f"[test-exec-history] After branch filter {branch_filter!r}: {len(raw_items)} rows "
+                f"(pre-filter total from JITA was {jita_total_pre_branch})"
+            )
+
+        def _oid(val):
+            if isinstance(val, dict) and "$oid" in val:
+                return val["$oid"]
+            return str(val) if val else None
+
+        def _date(val):
+            if isinstance(val, dict) and "$date" in val:
+                return val["$date"]
+            return val
+
+        def _test_set_name_from_embedded_agave(agt):
+            """Per-result test set from AgaveTask embed only."""
+            if not isinstance(agt, dict):
+                return ""
+            s = (agt.get("test_set_name") or "").strip()
+            if s:
+                return s
+            tso = agt.get("test_set")
+            if isinstance(tso, dict):
+                s = (tso.get("name") or "").strip()
+                if s:
+                    return s
+            elif isinstance(tso, str) and tso.strip():
+                return tso.strip()
+            return ""
+
+        def _test_set_from_history_row(item, agt):
+            """JITA test history row: prefer top-level + AgaveTask (same as /test_history table)."""
+            if isinstance(item, dict):
+                s = (item.get("test_set_name") or "").strip()
+                if s:
+                    return s
+                tso = item.get("test_set")
+                if isinstance(tso, dict):
+                    s = (tso.get("name") or "").strip()
+                    if s:
+                        return s
+                elif isinstance(tso, str) and tso.strip():
+                    return tso.strip()
+            return _test_set_name_from_embedded_agave(agt)
+
+        def _label_to_jp_display(label):
+            """Run label is the JP line on JITA history, e.g. Some_JP_Name-(42)."""
+            if not label or not isinstance(label, str):
+                return ""
+            return re.sub(r"-\(\d+\)$", "", label.strip())
+
+        def _jp_name_from_history_row(item, agt):
+            """JP for display: JITA /test_history uses run label; prefer that over job_profile_name."""
+            if isinstance(agt, dict):
+                lab = (agt.get("label") or "").strip()
+                if lab:
+                    d = _label_to_jp_display(lab)
+                    if d:
+                        return d
+                    return lab
+                jn = (agt.get("job_profile_name") or "").strip()
+                if jn:
+                    return jn
+            if isinstance(item, dict):
+                lab = (item.get("label") or "").strip()
+                if lab:
+                    d = _label_to_jp_display(lab)
+                    if d:
+                        return d
+                    return lab
+                jn = (item.get("job_profile_name") or "").strip()
+                if jn:
+                    return jn
+            return ""
+
+        def _test_names_from_ts_doc_tests_field(tests_field):
+            """Normalize JITA test_sets.tests entries to full testcase name strings."""
+            out = set()
+            if not isinstance(tests_field, list):
+                return out
+            for entry in tests_field:
+                if isinstance(entry, str) and entry.strip():
+                    out.add(entry.strip())
+                elif isinstance(entry, dict):
+                    n = entry.get("name") or entry.get("test") or entry.get("path")
+                    if isinstance(n, str) and n.strip():
+                        out.add(n.strip())
+            return out
+
+        # Collect unique task IDs so we can look up test_set / job_profile
+        unique_task_ids = list({
+            _oid(item.get("agave_task_id"))
+            for item in raw_items
+            if _oid(item.get("agave_task_id"))
+        })
+
+        task_info = {}  # task_id -> {test_set_name, job_profile_name, branch}
+        if unique_task_ids:
+            try:
+                tids_for_query = [{"$oid": tid} for tid in unique_task_ids[:100]]
+                rq = json.dumps({"_id": {"$in": tids_for_query}})
+                task_resp = requests.get(
+                    f"{JITA_BASE}/tasks",
+                    params={
+                        "raw_query": rq,
+                        "limit": len(tids_for_query),
+                        "only": "_id,test_sets,label,branch,job_profile",
+                    },
+                    auth=JITA_SVC_AUTH,
+                    verify=False,
+                    timeout=60,
+                )
+                if task_resp.status_code == 200:
+                    # Collect JP IDs to resolve names in bulk
+                    jp_id_map = {}  # jp_oid -> None (will fill with name)
+                    task_items = task_resp.json().get("data", [])
+                    for t in task_items:
+                        jp_ref = t.get("job_profile")
+                        jp_id = _oid(jp_ref) if jp_ref else None
+                        if jp_id:
+                            jp_id_map[jp_id] = None
+
+                    # Bulk-fetch JP names
+                    if jp_id_map:
+                        try:
+                            jp_ids_for_q = [{"$oid": jid} for jid in list(jp_id_map.keys())[:100]]
+                            jp_rq = json.dumps({"_id": {"$in": jp_ids_for_q}})
+                            jp_resp = requests.get(
+                                f"{JITA_BASE}/job_profiles",
+                                params={"raw_query": jp_rq, "limit": len(jp_ids_for_q), "only": "_id,name"},
+                                auth=JITA_SVC_AUTH, verify=False, timeout=30,
+                            )
+                            if jp_resp.status_code == 200:
+                                for jp_item in jp_resp.json().get("data", []):
+                                    jid = _oid(jp_item.get("_id"))
+                                    if jid:
+                                        jp_id_map[jid] = jp_item.get("name", "")
+                        except Exception as e:
+                            logger.warning(f"[test-exec-history] Failed to bulk-fetch JP names: {e}")
+
+                    for t in task_items:
+                        tid = _oid(t.get("_id"))
+                        if not tid:
+                            continue
+                        ts_list = t.get("test_sets") or []
+                        ts_name = ts_list[0].get("name", "") if ts_list else ""
+                        ts_refs = []
+                        for el in ts_list:
+                            if not isinstance(el, dict):
+                                continue
+                            rid = _oid(el.get("_id") or el)
+                            nm = (el.get("name") or "").strip()
+                            if rid or nm:
+                                ts_refs.append({"id": rid, "name": nm})
+
+                        # Get JP name: prefer resolved name, fall back to label parsing
+                        jp_ref = t.get("job_profile")
+                        jp_id = _oid(jp_ref) if jp_ref else None
+                        jp_name = jp_id_map.get(jp_id, "") if jp_id else ""
+                        if not jp_name:
+                            label = t.get("label", "")
+                            jp_name = re.sub(r"-\(\d+\)$", "", label) if label else ""
+
+                        task_info[tid] = {
+                            "test_set_name": ts_name,
+                            "ts_refs": ts_refs,
+                            "job_profile_name": jp_name,
+                            "branch": t.get("branch", ""),
+                        }
+                    logger.info(f"[test-exec-history] Fetched info for {len(task_info)} tasks, {len(jp_id_map)} unique JPs")
+            except Exception as e:
+                logger.warning(f"[test-exec-history] Failed to fetch task details: {e}")
+
+        # When a task has multiple test sets and a row has no embedded test set, match by testcase name.
+        ts_id_to_testnames = {}
+        ts_id_to_tsname = {}
+        if task_info:
+            need_ids = set()
+            for _tid, tmeta in task_info.items():
+                refs = tmeta.get("ts_refs") or []
+                if len(refs) > 1:
+                    for r in refs:
+                        rid = r.get("id")
+                        if rid:
+                            need_ids.add(rid)
+            if need_ids:
+                from urllib.parse import quote
+
+                for chunk in (
+                    list(need_ids)[i : i + 40] for i in range(0, min(len(need_ids), 200), 40)
+                ):
+                    if not chunk:
+                        break
+                    try:
+                        tq = json.dumps({"_id": {"$in": [{"$oid": x} for x in chunk]}})
+                        tsr = requests.get(
+                            f"{JITA_BASE}/test_sets",
+                            params={
+                                "raw_query": quote(tq),
+                                "limit": len(chunk),
+                                "only": "_id,tests,name",
+                            },
+                            auth=JITA_SVC_AUTH,
+                            verify=False,
+                            timeout=45,
+                        )
+                        if tsr.status_code == 200:
+                            for d in tsr.json().get("data", []):
+                                oid = _oid(d.get("_id"))
+                                if oid:
+                                    ts_id_to_testnames[oid] = _test_names_from_ts_doc_tests_field(
+                                        d.get("tests")
+                                    )
+                                    nm = (d.get("name") or "").strip()
+                                    if nm:
+                                        ts_id_to_tsname[oid] = nm
+                    except Exception as e:
+                        logger.warning(f"[test-exec-history] Batch test_sets fetch failed: {e}")
+
+        rows = []
+        seen_pairs = set()
+        unique_pairs = []
+        for item in raw_items:
+            sut = item.get("system_under_test") or {}
+            agave_task = item.get("AgaveTask") or {}
+            exec_id = _oid(item.get("agave_task_id"))
+            ti = task_info.get(exec_id, {})
+            # Test set: JITA history row first (matches /test_history), then multi-TS membership, then task.
+            row_ts = _test_set_from_history_row(item, agave_task)
+            if not row_ts:
+                refs = ti.get("ts_refs") or []
+                if len(refs) > 1 and test_name:
+                    for r in refs:
+                        rid = r.get("id")
+                        if not rid:
+                            continue
+                        tnames = ts_id_to_testnames.get(rid)
+                        if tnames and test_name in tnames:
+                            row_ts = (r.get("name") or "").strip() or ts_id_to_tsname.get(rid, "")
+                            if row_ts:
+                                break
+            ts = row_ts or ti.get("test_set_name", "")
+            # JP: history label / row fields first (user expects test set + label as on JITA for that branch).
+            jp = _jp_name_from_history_row(item, agave_task) or ti.get("job_profile_name", "")
+            rows.append({
+                "id": _oid(item.get("_id")),
+                "execution_id": exec_id,
+                "branch": sut.get("branch", "") or ti.get("branch", ""),
+                "test_set": ts,
+                "job_profile": jp,
+                "date_started": _date(item.get("start_time")),
+                "date_ended": _date(item.get("end_time")),
+                "status": item.get("status", ""),
+                "jira_tickets": item.get("jira_tickets") or [],
+                "exception_summary": item.get("exception_summary") or "",
+                "label": agave_task.get("label", ""),
+            })
+            pair_key = f"{ts}|||{jp}"
+            if (ts or jp) and pair_key not in seen_pairs:
+                seen_pairs.add(pair_key)
+                unique_pairs.append({"test_set": ts, "job_profile": jp})
+
+        return jsonify({
+            "success": True,
+            "data": rows,
+            "unique_pairs": unique_pairs,
+            "total": total,
+            "page": page,
+            "limit": limit,
+        })
+    except requests.exceptions.Timeout:
+        logger.warning("[test-exec-history] Timeout querying JITA")
+        return jsonify({"error": "JITA request timed out", "data": [], "total": 0})
+    except Exception as e:
+        logger.error(f"[test-exec-history] Error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/mcp/regression/dynamic-jp/testcase-history", methods=["POST"])
+def dynamic_jp_testcase_history():
+    """Fetch testcase run history from JITA and return associated JPs and test sets."""
+    try:
+        req_data = request.json
+        if not req_data:
+            return jsonify({"error": "Request body is required (JSON)"}), 400
+
+        testcase_names = req_data.get("testcase_names", [])
+        branch = req_data.get("branch", "master")
+
+        if not testcase_names or not isinstance(testcase_names, list):
+            return jsonify({"error": "testcase_names must be a non-empty list"}), 400
+
+        # Sanitize: limit to 20 testcases to avoid overloading
+        testcase_names = [str(tc) for tc in testcase_names[:20]]
+
+        results = []
+
+        def extract_search_keyword(tc_name):
+            """Extract a meaningful keyword from a fully qualified testcase name.
+            e.g. 'cdp.stargate.storage_policy.api.test_storage_policy...' -> 'storage_policy'
+            """
+            parts = tc_name.replace(".", " ").replace("/", " ").split()
+            # Pick the most specific non-generic part (skip cdp, stargate, test_, api, etc.)
+            skip = {"cdp", "stargate", "test", "api", "tests", "module", "class", "self"}
+            for part in parts:
+                cleaned = re.sub(r"^test_", "", part)
+                if cleaned and cleaned.lower() not in skip and len(cleaned) > 3:
+                    return cleaned
+            # Fallback: use the 3rd component if available
+            dot_parts = tc_name.split(".")
+            if len(dot_parts) >= 3:
+                return dot_parts[2]
+            return tc_name.split(".")[-1] if "." in tc_name else tc_name
+
+        def _parse_jita_items(data, kind="jp"):
+            """Parse JITA response data into a flat list of dicts."""
+            items = []
+            raw_list = data.get("data", []) if isinstance(data, dict) else []
+            for item in raw_list:
+                if not isinstance(item, dict):
+                    continue
+                item_id = item.get("_id")
+                if isinstance(item_id, dict) and "$oid" in item_id:
+                    item_id = item_id["$oid"]
+                elif not isinstance(item_id, str):
+                    item_id = str(item_id) if item_id else None
+                if kind == "jp":
+                    items.append({
+                        "_id": item_id,
+                        "name": item.get("name", ""),
+                        "description": item.get("description", ""),
+                    })
+                else:
+                    items.append({
+                        "_id": item_id,
+                        "path": item.get("path", "") or "",
+                        "name": item.get("name", "") or "",
+                        "test_args": item.get("test_args", "") or "",
+                        "framework_args": item.get("framework_args", "") or "",
+                    })
+            return items
+
+        def _search_jps(keyword, branch_val):
+            """Search job_profiles by keyword + branch, fall back to keyword only."""
+            from urllib.parse import quote
+            jp_details = []
+            try:
+                jp_pattern = f".*{re.escape(keyword)}.*{re.escape(branch_val)}"
+                raw_q = json.dumps({"name": {"$regex": jp_pattern, "$options": "i"}})
+                resp = requests.get(
+                    f"{JITA_BASE}/job_profiles",
+                    params={"raw_query": quote(raw_q), "limit": 10, "only": "_id,name,description"},
+                    auth=JITA_SVC_AUTH, verify=False, timeout=45
+                )
+                if resp.status_code == 200:
+                    jp_details = _parse_jita_items(resp.json(), "jp")
+            except (requests.exceptions.RequestException, ValueError) as e:
+                logger.warning(f"JP search failed for '{keyword}+{branch_val}': {e}")
+
+            if not jp_details:
+                try:
+                    raw_q2 = json.dumps({"name": {"$regex": f".*{re.escape(keyword)}.*", "$options": "i"}})
+                    resp2 = requests.get(
+                        f"{JITA_BASE}/job_profiles",
+                        params={"raw_query": quote(raw_q2), "limit": 10, "only": "_id,name,description"},
+                        auth=JITA_SVC_AUTH, verify=False, timeout=45
+                    )
+                    if resp2.status_code == 200:
+                        jp_details = _parse_jita_items(resp2.json(), "jp")
+                except (requests.exceptions.RequestException, ValueError) as e:
+                    logger.warning(f"JP fallback search failed for '{keyword}': {e}")
+            return jp_details
+
+        def _search_test_sets(keyword):
+            """Search test_sets by keyword."""
+            from urllib.parse import quote
+            try:
+                raw_q = json.dumps({"name": {"$regex": f".*{re.escape(keyword)}.*", "$options": "i"}})
+                resp = requests.get(
+                    f"{JITA_BASE}/test_sets",
+                    params={"raw_query": quote(raw_q), "limit": 10, "only": "_id,name,path,test_args,framework_args"},
+                    auth=JITA_SVC_AUTH, verify=False, timeout=60
+                )
+                if resp.status_code == 200:
+                    return _parse_jita_items(resp.json(), "ts")
+            except (requests.exceptions.RequestException, ValueError) as e:
+                logger.warning(f"Test set search failed for '{keyword}': {e}")
+            return []
+
+        def fetch_single_testcase(tc_name):
+            tc_name = tc_name.strip() if isinstance(tc_name, str) else ""
+            if not tc_name:
+                return None
+            try:
+                keyword = extract_search_keyword(tc_name)
+                logger.info(f"[dynamic-jp] Searching for testcase '{tc_name}' using keyword '{keyword}' on branch '{branch}'")
+
+                # Run JP and TS searches in parallel for speed
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                jp_details = []
+                ts_details = []
+                with ThreadPoolExecutor(max_workers=2) as mini_pool:
+                    jp_future = mini_pool.submit(_search_jps, keyword, branch)
+                    ts_future = mini_pool.submit(_search_test_sets, keyword)
+                    try:
+                        jp_details = jp_future.result(timeout=90)
+                    except Exception as e:
+                        logger.warning(f"JP parallel search error: {e}")
+                    try:
+                        ts_details = ts_future.result(timeout=90)
+                    except Exception as e:
+                        logger.warning(f"TS parallel search error: {e}")
+
+                return {
+                    "testcase": tc_name,
+                    "keyword": keyword,
+                    "runs": [],
+                    "job_profiles": jp_details,
+                    "test_sets": ts_details,
+                }
+            except requests.exceptions.Timeout:
+                logger.warning(f"Timeout fetching history for {tc_name}")
+                return {"testcase": tc_name, "error": "Request timed out", "runs": [], "job_profiles": [], "test_sets": []}
+            except requests.exceptions.ConnectionError:
+                logger.warning(f"Connection error fetching history for {tc_name}")
+                return {"testcase": tc_name, "error": "Connection error to JITA", "runs": [], "job_profiles": [], "test_sets": []}
+            except Exception as e:
+                logger.error(f"Error fetching history for {tc_name}: {e}")
+                return {"testcase": tc_name, "error": str(e), "runs": [], "job_profiles": [], "test_sets": []}
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(fetch_single_testcase, tc): tc for tc in testcase_names}
+            for future in as_completed(futures):
+                try:
+                    result = future.result(timeout=60)
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    logger.error(f"Future exception in testcase-history: {e}")
+
+        return jsonify({"success": True, "results": results})
+    except Exception as e:
+        logger.error(f"Error in dynamic-jp testcase-history: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+def _dynamic_jp_ts_prefix_for_date(dyn_date_str=None):
+    """Prefixes for auto-named dynamic JP/TS: User_Dyn_<YYYYMMDD>_JP_ / User_Dyn_<YYYYMMDD>_TS_."""
+    if (
+        dyn_date_str
+        and isinstance(dyn_date_str, str)
+        and len(dyn_date_str.strip()) == 8
+        and dyn_date_str.strip().isdigit()
+    ):
+        date_str = dyn_date_str.strip()
+    else:
+        date_str = datetime.now().strftime("%Y%m%d")
+    jp_p = f"User_Dyn_{date_str}_JP_"
+    ts_p = f"User_Dyn_{date_str}_TS_"
+    return jp_p, ts_p
+
+
+# Monotonic sequence per YYYYMMDD; increments on every /dynamic-jp/create attempt (success or fail after bump).
+DYN_NAME_SEQ_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dyn_name_sequence.json")
+_dyn_name_seq_lock = threading.Lock()
+
+
+def _dyn_name_seq_date_key(dyn_name_date):
+    d = (dyn_name_date or "").strip()
+    if d and len(d) == 8 and d.isdigit():
+        return d
+    return datetime.now().strftime("%Y%m%d")
+
+
+def _load_dyn_name_seq() -> dict:
+    try:
+        with open(DYN_NAME_SEQ_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                out = {}
+                for k, v in data.items():
+                    ks = str(k)
+                    if len(ks) == 8 and ks.isdigit():
+                        try:
+                            out[ks] = int(v)
+                        except (TypeError, ValueError):
+                            pass
+                return out
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return {}
+
+
+def _save_dyn_name_seq(data: dict) -> None:
+    try:
+        with open(DYN_NAME_SEQ_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=0)
+    except OSError as e:
+        logger.warning(f"Could not write {DYN_NAME_SEQ_FILE}: {e}")
+
+
+def _peek_next_dyn_name_seq(dyn_name_date):
+    """Next sequence number to suggest (1 + last used); does not modify store."""
+    key = _dyn_name_seq_date_key(dyn_name_date)
+    with _dyn_name_seq_lock:
+        data = _load_dyn_name_seq()
+        return int(data.get(key, 0)) + 1
+
+
+def _bump_dyn_name_seq(dyn_name_date):
+    """Increment and return the sequence to use for this /create call (one bump per create request)."""
+    key = _dyn_name_seq_date_key(dyn_name_date)
+    with _dyn_name_seq_lock:
+        data = _load_dyn_name_seq()
+        n = int(data.get(key, 0)) + 1
+        data[key] = n
+        _save_dyn_name_seq(data)
+    logger.info(f"[dyn-seq] date={key} last_reserved={n}")
+    return n
+
+
+def _apply_reserved_seq_to_dyn_custom_name(name: str, date_key: str, seq: int) -> str:
+    """Rewrite User_Dyn_{date}_JP_n / _TS_n to use `seq` (per create attempt)."""
+    if not name or not date_key:
+        return name
+    s = re.sub(
+        rf"(User_Dyn_{re.escape(date_key)}_JP_)\d+",
+        rf"\g<1>{seq}",
+        name,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(
+        rf"(User_Dyn_{re.escape(date_key)}_TS_)\d+",
+        rf"\g<1>{seq}",
+        s,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    return s
+
+
+# Default JITA test set "framework options" (framework_args JSON object) for dynamic creates.
+# On clone, merge with source: source keys win; any default key missing in source is added.
+# If a cloned TS already has all of these keys (order irrelevant), do not change framework_args.
+DYN_TESTSET_DEFAULT_FRAMEWORK_OPTS = {
+    "no_log_collection": False,
+    "scatter_logs": "cascade",
+    "use_logbay": "",
+    "log_level": "DEBUG",
+}
+
+
+def _framework_args_value_to_dict(val):
+    """Normalize test set framework_args from JITA (JSON string or dict) to a dict."""
+    if val is None:
+        return {}
+    if isinstance(val, dict):
+        return dict(val)
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return {}
+        try:
+            parsed = json.loads(s)
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+    return {}
+
+
+def _merge_dyn_testset_framework_args(existing):
+    """Apply defaults, then overlay existing (from clone or prior fetch)."""
+    ex = _framework_args_value_to_dict(existing)
+    return {**DYN_TESTSET_DEFAULT_FRAMEWORK_OPTS, **ex}
+
+
+def _framework_args_dict_has_all_dyn_default_keys(framework_args_val):
+    """True if every key in DYN_TESTSET_DEFAULT_FRAMEWORK_OPTS exists (order does not matter)."""
+    d = _framework_args_value_to_dict(framework_args_val)
+    return all(k in d for k in DYN_TESTSET_DEFAULT_FRAMEWORK_OPTS)
+
+
+def _apply_default_framework_options_to_test_set_payload(ts_payload):
+    """Mutate a POST /test_sets body: set framework_args / frameworkArgs to merged JSON string."""
+    if not isinstance(ts_payload, dict):
+        return ts_payload
+    existing = ts_payload.get("framework_args")
+    if existing in (None, ""):
+        existing = ts_payload.get("frameworkArgs")
+    merged = _merge_dyn_testset_framework_args(existing)
+    fa_str = json.dumps(merged, separators=(",", ":"))
+    ts_payload["framework_args"] = fa_str
+    ts_payload["frameworkArgs"] = fa_str
+    return ts_payload
+
+
+@app.route("/mcp/regression/dynamic-jp/check-existing", methods=["POST"])
+def dynamic_jp_check_existing():
+    """Search for existing dynamic JP/TS by name prefix; suggest next numeric suffix.
+
+    Defaults to User_Dyn_<YYYYMMDD>_JP_ / User_Dyn_<YYYYMMDD>_TS_ (local server date, or
+    optional dyn_name_date=YYYYMMDD). Clients may still pass jp_pattern / ts_pattern.
+    """
+    try:
+        req_data = request.json or {}
+        dyn_name_date = (req_data.get("dyn_name_date") or "").strip()
+        if dyn_name_date and (len(dyn_name_date) != 8 or not dyn_name_date.isdigit()):
+            return jsonify({"error": "dyn_name_date must be YYYYMMDD"}), 400
+
+        def_jp, def_ts = _dynamic_jp_ts_prefix_for_date(dyn_name_date or None)
+        jp_raw = (req_data.get("jp_pattern") or "").strip() or def_jp
+        ts_raw = (req_data.get("ts_pattern") or "").strip() or def_ts
+
+        # Sanitize patterns to avoid regex injection
+        jp_pattern = re.escape(jp_raw)
+        ts_pattern = re.escape(ts_raw)
+
+        from urllib.parse import quote
+
+        existing_jps = []
+        try:
+            raw_query = json.dumps({"name": {"$regex": f"^{jp_pattern}", "$options": "i"}})
+            params = {"raw_query": quote(raw_query), "limit": 100}
+            resp = requests.get(
+                f"{JITA_BASE}/job_profiles",
+                params=params,
+                auth=JITA_SVC_AUTH,
+                verify=False,
+                timeout=30
+            )
+            if resp.status_code == 200:
+                resp_data = resp.json()
+                jp_list = resp_data.get("data", []) if isinstance(resp_data, dict) else []
+                for jp in jp_list:
+                    if not isinstance(jp, dict):
+                        continue
+                    jp_id = jp.get("_id")
+                    if isinstance(jp_id, dict) and "$oid" in jp_id:
+                        jp_id = jp_id["$oid"]
+                    elif not isinstance(jp_id, str):
+                        jp_id = str(jp_id) if jp_id else None
+                    existing_jps.append({
+                        "_id": jp_id,
+                        "name": jp.get("name", ""),
+                        "description": jp.get("description", ""),
+                        "created_at": jp.get("created_at"),
+                    })
+            else:
+                logger.warning(f"check-existing: JP search returned {resp.status_code}")
+        except (requests.exceptions.RequestException, ValueError) as e:
+            logger.warning(f"check-existing: Failed to fetch JPs: {e}")
+
+        existing_ts = []
+        try:
+            raw_query_ts = json.dumps({"name": {"$regex": f"^{ts_pattern}", "$options": "i"}})
+            params_ts = {"raw_query": quote(raw_query_ts), "limit": 100}
+            resp_ts = requests.get(
+                f"{JITA_BASE}/test_sets",
+                params=params_ts,
+                auth=JITA_SVC_AUTH,
+                verify=False,
+                timeout=30
+            )
+            if resp_ts.status_code == 200:
+                resp_ts_data = resp_ts.json()
+                ts_list = resp_ts_data.get("data", []) if isinstance(resp_ts_data, dict) else []
+                for ts in ts_list:
+                    if not isinstance(ts, dict):
+                        continue
+                    ts_id = ts.get("_id")
+                    if isinstance(ts_id, dict) and "$oid" in ts_id:
+                        ts_id = ts_id["$oid"]
+                    elif not isinstance(ts_id, str):
+                        ts_id = str(ts_id) if ts_id else None
+                    existing_ts.append({
+                        "_id": ts_id,
+                        "name": ts.get("name", ""),
+                        "description": ts.get("description", ""),
+                    })
+            else:
+                logger.warning(f"check-existing: TS search returned {resp_ts.status_code}")
+        except (requests.exceptions.RequestException, ValueError) as e:
+            logger.warning(f"check-existing: Failed to fetch test sets: {e}")
+
+        next_jp_num = 1
+        next_ts_num = 1
+        for jp in existing_jps:
+            name = jp.get("name", "")
+            parts = name.rsplit("_", 1)
+            if len(parts) == 2:
+                try:
+                    num = int(parts[1])
+                    next_jp_num = max(next_jp_num, num + 1)
+                except (ValueError, TypeError):
+                    pass
+        for ts in existing_ts:
+            name = ts.get("name", "")
+            parts = name.rsplit("_", 1)
+            if len(parts) == 2:
+                try:
+                    num = int(parts[1])
+                    next_ts_num = max(next_ts_num, num + 1)
+                except (ValueError, TypeError):
+                    pass
+
+        date_key = dyn_name_date if (dyn_name_date and len(dyn_name_date) == 8 and dyn_name_date.isdigit()) else datetime.now().strftime("%Y%m%d")
+        seq_peek = _peek_next_dyn_name_seq(date_key)
+        # Never suggest a number below JITA reality or our next reserved slot
+        next_both = max(next_jp_num, next_ts_num, seq_peek)
+        next_jp_num = next_both
+        next_ts_num = next_both
+
+        return jsonify({
+            "success": True,
+            "job_profiles": existing_jps,
+            "test_sets": existing_ts,
+            "next_jp_number": next_jp_num,
+            "next_ts_number": next_ts_num,
+            "jp_name_prefix": jp_raw,
+            "ts_name_prefix": ts_raw,
+        })
+    except Exception as e:
+        logger.error(f"Error in dynamic-jp check-existing: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/mcp/regression/dynamic-jp/fetch-testset", methods=["POST"])
+def dynamic_jp_fetch_testset():
+    """Fetch a test set's details (test_args, framework_args) by ID or path."""
+    try:
+        req_data = request.json
+        if not req_data:
+            return jsonify({"error": "Request body is required (JSON)"}), 400
+
+        testset_id = req_data.get("testset_id")
+        testset_path = req_data.get("testset_path")
+
+        if not testset_id and not testset_path:
+            return jsonify({"error": "testset_id or testset_path is required"}), 400
+
+        # Sanitize inputs
+        if testset_id:
+            testset_id = str(testset_id).strip()
+        if testset_path:
+            testset_path = str(testset_path).strip()
+
+        try:
+            if testset_id:
+                resp = requests.get(
+                    f"{JITA_BASE}/test_sets/{testset_id}",
+                    auth=JITA_SVC_AUTH,
+                    verify=False,
+                    timeout=30
+                )
+            else:
+                from urllib.parse import quote
+                raw_query = json.dumps({"path": testset_path})
+                params = {"raw_query": quote(raw_query), "limit": 1}
+                resp = requests.get(
+                    f"{JITA_BASE}/test_sets",
+                    params=params,
+                    auth=JITA_SVC_AUTH,
+                    verify=False,
+                    timeout=30
+                )
+        except requests.exceptions.Timeout:
+            return jsonify({"error": "Request to JITA timed out"}), 504
+        except requests.exceptions.ConnectionError:
+            return jsonify({"error": "Could not connect to JITA API"}), 503
+
+        if resp.status_code != 200:
+            return jsonify({"error": f"JITA API error: {resp.status_code}"}), 500
+
+        try:
+            data = resp.json()
+        except (ValueError, TypeError):
+            return jsonify({"error": "Invalid JSON response from JITA"}), 500
+
+        ts_data = data.get("data", {}) if isinstance(data, dict) else {}
+        if isinstance(ts_data, list):
+            ts_data = ts_data[0] if ts_data else {}
+        if not isinstance(ts_data, dict):
+            ts_data = {}
+
+        ts_id = ts_data.get("_id")
+        if isinstance(ts_id, dict) and "$oid" in ts_id:
+            ts_id = ts_id["$oid"]
+        elif ts_id and not isinstance(ts_id, str):
+            ts_id = str(ts_id)
+
+        tests = ts_data.get("tests", [])
+        if not isinstance(tests, list):
+            tests = []
+
+        return jsonify({
+            "success": True,
+            "test_set": {
+                "_id": ts_id,
+                "name": ts_data.get("name", "") or "",
+                "path": ts_data.get("path", "") or "",
+                "test_args": ts_data.get("test_args", "") or "",
+                "framework_args": ts_data.get("framework_args", "") or "",
+                "tests": tests,
+                "description": ts_data.get("description", "") or "",
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error in dynamic-jp fetch-testset: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+JARVIS_BASE = "https://jarvis.eng.nutanix.com/api/v1"
+
+
+@app.route("/mcp/regression/dynamic-jp/resolve-names", methods=["POST"])
+def dynamic_jp_resolve_names():
+    """Resolve JP and/or test set names to their JITA IDs."""
+    try:
+        req_data = request.json
+        if not req_data:
+            return jsonify({"error": "Request body is required (JSON)"}), 400
+
+        jp_name = (req_data.get("jp_name") or "").strip()
+        ts_name = (req_data.get("ts_name") or "").strip()
+
+        if not jp_name and not ts_name:
+            return jsonify({"error": "At least one of jp_name or ts_name is required"}), 400
+
+        from urllib.parse import quote
+
+        def _oid(val):
+            if isinstance(val, dict) and "$oid" in val:
+                return val["$oid"]
+            return str(val) if val else None
+
+        result = {"jp": None, "ts": None}
+
+        if jp_name:
+            try:
+                raw_q = json.dumps({"name": jp_name})
+                resp = requests.get(
+                    f"{JITA_BASE}/job_profiles",
+                    params={"raw_query": quote(raw_q), "limit": 1, "only": "_id,name,description,tags,tester_tags"},
+                    auth=JITA_SVC_AUTH, verify=False, timeout=30,
+                )
+                logger.info(f"[resolve-names] JP lookup for '{jp_name}': HTTP {resp.status_code}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    items = data.get("data", []) if isinstance(data, dict) else []
+                    if items and isinstance(items, list) and isinstance(items[0], dict):
+                        item = items[0]
+                        result["jp"] = {
+                            "_id": _oid(item.get("_id")),
+                            "name": item.get("name", ""),
+                            "description": item.get("description", ""),
+                            "tags": item.get("tags", []) or [],
+                            "tester_tags": item.get("tester_tags", []) or [],
+                        }
+                else:
+                    logger.warning(f"[resolve-names] JP search returned {resp.status_code}: {resp.text[:200]}")
+            except Exception as e:
+                logger.warning(f"[resolve-names] Failed to resolve JP '{jp_name}': {e}")
+
+        if ts_name:
+            try:
+                raw_q = json.dumps({"name": ts_name})
+                resp = requests.get(
+                    f"{JITA_BASE}/test_sets",
+                    params={"raw_query": quote(raw_q), "limit": 1, "only": "_id,name,test_args,framework_args"},
+                    auth=JITA_SVC_AUTH, verify=False, timeout=30,
+                )
+                logger.info(f"[resolve-names] TS lookup for '{ts_name}': HTTP {resp.status_code}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    items = data.get("data", []) if isinstance(data, dict) else []
+                    if items and isinstance(items, list) and isinstance(items[0], dict):
+                        item = items[0]
+                        ta = item.get("test_args") or item.get("testArgs") or ""
+                        fa = item.get("framework_args") or item.get("frameworkArgs") or ""
+                        result["ts"] = {
+                            "_id": _oid(item.get("_id")),
+                            "name": item.get("name", ""),
+                            "test_args": str(ta).strip() if ta is not None else "",
+                            "framework_args": str(fa).strip() if fa is not None else "",
+                        }
+                else:
+                    logger.warning(f"[resolve-names] TS search returned {resp.status_code}: {resp.text[:200]}")
+            except Exception as e:
+                logger.warning(f"[resolve-names] Failed to resolve TS '{ts_name}': {e}")
+
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        logger.error(f"Error in dynamic-jp resolve-names: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/mcp/regression/dynamic-jp/search-node-pools", methods=["POST"])
+def dynamic_jp_search_node_pools():
+    """Search Jarvis node pools by name keyword."""
+    try:
+        req_data = request.json or {}
+        query = (req_data.get("query") or "").strip()
+        if len(query) < 2:
+            return jsonify({"pools": []})
+
+        tokens = re.split(r'[\s_\-]+', query)
+        tokens = [t for t in tokens if t]
+
+        primary = max(tokens, key=len) if tokens else query
+        pattern = re.escape(primary)
+
+        raw_q = json.dumps({"name": {"$regex": pattern, "$options": "i"}})
+        resp = requests.get(
+            f"{JARVIS_BASE}/pools",
+            params={"raw_query": raw_q, "limit": 100},
+            auth=JITA_SVC_AUTH, verify=False, timeout=15
+        )
+        pools = []
+        if resp.status_code == 200:
+            for item in resp.json().get("data", []):
+                name = item.get("name") or ""
+                if not name or name in pools:
+                    continue
+                name_lower = name.lower()
+                if all(t.lower() in name_lower for t in tokens):
+                    pools.append(name)
+        return jsonify({"pools": pools})
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "Timed out searching node pools", "pools": []}), 504
+    except Exception as e:
+        logger.error(f"Error searching node pools: {e}", exc_info=True)
+        return jsonify({"error": str(e), "pools": []}), 500
+
+
+@app.route("/mcp/regression/dynamic-jp/search-branches", methods=["POST"])
+def dynamic_jp_search_branches():
+    """Search JITA branches by name."""
+    try:
+        req_data = request.json or {}
+        query = (req_data.get("query") or "").strip()
+        if len(query) < 2:
+            return jsonify({"branches": []})
+
+        pattern = re.escape(query)
+        raw_q = json.dumps({"name": {"$regex": pattern, "$options": "i"}})
+        resp = requests.get(
+            f"{JITA_BASE}/branches",
+            params={"raw_query": raw_q, "limit": 20},
+            auth=JITA_SVC_AUTH, verify=False, timeout=15
+        )
+        branches = []
+        if resp.status_code == 200:
+            for item in resp.json().get("data", []):
+                name = item.get("name") or ""
+                if name and name not in branches:
+                    branches.append(name)
+        # Sort so exact-prefix matches come first
+        q_lower = query.lower()
+        branches.sort(key=lambda b: (0 if b.lower().startswith(q_lower) else 1, b.lower()))
+        return jsonify({"branches": branches})
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "Timed out", "branches": []}), 504
+    except Exception as e:
+        logger.error(f"Error searching branches: {e}", exc_info=True)
+        return jsonify({"error": str(e), "branches": []}), 500
+
+
+@app.route("/mcp/regression/dynamic-jp/search-clusters", methods=["POST"])
+def dynamic_jp_search_clusters():
+    """Search JITA clusters by name or IP."""
+    try:
+        req_data = request.json or {}
+        query = (req_data.get("query") or "").strip()
+        if len(query) < 2:
+            return jsonify({"clusters": []})
+
+        pattern = re.escape(query)
+        raw_q = json.dumps({"name": {"$regex": pattern, "$options": "i"}})
+        resp = requests.get(
+            f"{JITA_BASE}/clusters",
+            params={"raw_query": raw_q, "limit": 20},
+            auth=JITA_SVC_AUTH, verify=False, timeout=15
+        )
+        clusters = []
+        seen = set()
+        if resp.status_code == 200:
+            for item in resp.json().get("data", []):
+                name = item.get("name") or ""
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                clusters.append({
+                    "name": name,
+                    "status": item.get("status", ""),
+                })
+        return jsonify({"clusters": clusters})
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "Timed out searching clusters", "clusters": []}), 504
+    except Exception as e:
+        logger.error(f"Error searching clusters: {e}", exc_info=True)
+        return jsonify({"error": str(e), "clusters": []}), 500
+
+
+@app.route("/mcp/regression/dynamic-jp/create", methods=["POST"])
+def dynamic_jp_create():
+    """Create a dynamic JP and test set. Two modes:
+    - create_fresh=True: brand-new JP+TS from scratch with the given testcases
+    - create_fresh=False: clone from source_jp_id, optionally copying test_args from source_testset_id
+    """
+    try:
+        req_data = request.json
+        if not req_data:
+            return jsonify({"error": "Request body is required (JSON)"}), 400
+
+        create_fresh = bool(req_data.get("create_fresh", False))
+        source_jp_id = req_data.get("source_jp_id")
+        source_testset_id = req_data.get("source_testset_id")
+        nos_branch = req_data.get("nos_branch", "master") or "master"
+        nos_tag = req_data.get("nos_tag", "Latest Smoke Passed") or "Latest Smoke Passed"
+        pc_branch = req_data.get("pc_branch", "master") or "master"
+        pc_tag = req_data.get("pc_tag", "Latest Smoke Passed") or "Latest Smoke Passed"
+        nutest_branch = req_data.get("nutest_branch", "master") or "master"
+        provider = req_data.get("provider", "global_pool") or "global_pool"
+        resource_type = req_data.get("resource_type", "nested_2.0") or "nested_2.0"
+        raw_np = req_data.get("node_pool") or []
+        if isinstance(raw_np, list):
+            node_pools = [p.strip() for p in raw_np if isinstance(p, str) and p.strip()]
+        else:
+            node_pools = [raw_np.strip()] if isinstance(raw_np, str) and raw_np.strip() else []
+        framework_patch_url = (req_data.get("framework_patch_url") or "").strip() or None
+        test_patch_url = (req_data.get("test_patch_url") or "").strip() or None
+        testcase_names = req_data.get("testcase_names", [])
+        custom_jp_name = (req_data.get("custom_jp_name") or "").strip() or None
+        custom_ts_name = (req_data.get("custom_ts_name") or "").strip() or None
+        jp_tags = req_data.get("jp_tags") or []
+        if isinstance(jp_tags, str):
+            jp_tags = [t.strip() for t in jp_tags.split(",") if t.strip()]
+        elif not isinstance(jp_tags, list):
+            jp_tags = []
+
+        reuse_source_ts = bool(req_data.get("reuse_source_ts", False))
+        if reuse_source_ts and create_fresh:
+            return jsonify({
+                "error": "reuse_source_ts is only valid when cloning from an existing job profile (not fresh create).",
+            }), 400
+
+        if not create_fresh:
+            if not source_jp_id:
+                return jsonify({"error": "source_jp_id is required when not creating fresh"}), 400
+            source_jp_id = str(source_jp_id).strip()
+            if not source_jp_id:
+                return jsonify({"error": "source_jp_id cannot be empty"}), 400
+
+        if source_testset_id:
+            source_testset_id = str(source_testset_id).strip()
+
+        if not isinstance(testcase_names, list):
+            testcase_names = []
+        testcase_names = [str(tc).strip() for tc in testcase_names if tc]
+
+        if create_fresh and not testcase_names:
+            return jsonify({"error": "testcase_names is required when creating fresh"}), 400
+
+        logger.info(f"[create] mode={'fresh' if create_fresh else 'clone'}, "
+                     f"source_jp_id={source_jp_id}, source_testset_id={source_testset_id}, "
+                     f"source_testset_name={(req_data.get('source_testset_name') or '').strip() or None}, "
+                     f"custom_jp_name={custom_jp_name}, custom_ts_name={custom_ts_name}, "
+                     f"#testcases={len(testcase_names)}, #tags={len(jp_tags)}")
+
+        from urllib.parse import quote
+
+        # 1. Fetch source JP (only when cloning)
+        source_jp = {}
+        if not create_fresh:
+            try:
+                jp_resp = requests.get(
+                    f"{JITA_BASE}/job_profiles/{source_jp_id}",
+                    auth=JITA_SVC_AUTH,
+                    verify=False,
+                    timeout=30
+                )
+            except requests.exceptions.Timeout:
+                return jsonify({"error": "Timed out fetching source job profile from JITA"}), 504
+            except requests.exceptions.ConnectionError:
+                return jsonify({"error": "Could not connect to JITA to fetch source job profile"}), 503
+
+            if jp_resp.status_code != 200:
+                return jsonify({"error": f"Failed to fetch source JP (HTTP {jp_resp.status_code}). Verify the JP ID is correct."}), 500
+
+            try:
+                source_jp = jp_resp.json().get("data", {})
+            except (ValueError, TypeError):
+                return jsonify({"error": "Invalid JSON from JITA when fetching source JP"}), 500
+
+            if not source_jp or not isinstance(source_jp, dict):
+                return jsonify({"error": f"Source JP '{source_jp_id}' returned empty data. It may not exist."}), 404
+
+        def _test_set_ref_oid(ref):
+            if isinstance(ref, dict):
+                if "$oid" in ref:
+                    return str(ref["$oid"]).strip() or None
+                inner = ref.get("_id")
+                if isinstance(inner, dict) and "$oid" in inner:
+                    return str(inner["$oid"]).strip() or None
+                if isinstance(inner, str) and inner.strip():
+                    return inner.strip()
+            if isinstance(ref, str) and ref.strip():
+                return ref.strip()
+            return None
+
+        def _jit_ts_arg_strings(ts):
+            """JITA may expose args as snake_case or camelCase; normalize to strings for POST payload."""
+            if not isinstance(ts, dict):
+                return "", ""
+
+            def _coerce(val):
+                if val is None:
+                    return ""
+                if isinstance(val, dict):
+                    try:
+                        return json.dumps(val, separators=(",", ":"))
+                    except (TypeError, ValueError):
+                        return ""
+                if isinstance(val, list):
+                    try:
+                        return json.dumps(val, separators=(",", ":"))
+                    except (TypeError, ValueError):
+                        return ""
+                s = str(val).strip()
+                return s
+
+            ta = _coerce(ts.get("test_args")) or _coerce(ts.get("testArgs"))
+            fa = _coerce(ts.get("framework_args")) or _coerce(ts.get("frameworkArgs"))
+            return ta, fa
+
+        def _jit_pick_ts_dict_from_response(ts_json):
+            """Normalize GET /test_sets/:id (or similar) JSON to one test set dict."""
+            if not isinstance(ts_json, dict):
+                return {}
+            data = ts_json.get("data")
+            if isinstance(data, list):
+                for el in data:
+                    if isinstance(el, dict):
+                        return el
+                return {}
+            if isinstance(data, dict):
+                d = data
+                for wrap in ("test_set", "document", "result", "item"):
+                    inner = d.get(wrap)
+                    if isinstance(inner, dict) and any(
+                        k in inner
+                        for k in ("tests", "test_args", "testArgs", "framework_args", "frameworkArgs", "name", "_id")
+                    ):
+                        return inner
+                return d
+            return {}
+
+        def _build_clone_test_set_post_payload(source_doc, new_name, test_entries, description):
+            """POST /test_sets with same top-level shape as JITA GET, plus mirrored arg keys."""
+            import copy
+
+            strip_keys = {
+                "_id", "id", "created_at", "updated_at", "created_by", "updated_by",
+                "__v", "createdAt", "updatedAt", "path",
+            }
+            if not isinstance(source_doc, dict) or not source_doc:
+                p = {"name": new_name, "tests": test_entries, "description": description}
+                ta, fa = "", ""
+                p["test_args"] = ta
+                p["framework_args"] = fa
+                p["testArgs"] = ta
+                p["frameworkArgs"] = fa
+                return p
+            payload = {k: copy.deepcopy(v) for k, v in source_doc.items() if k not in strip_keys}
+            payload["name"] = new_name
+            payload["tests"] = test_entries
+            payload["description"] = description
+            for snake, camel in (("test_args", "testArgs"), ("framework_args", "frameworkArgs")):
+                if snake in payload and camel not in payload:
+                    payload[camel] = payload[snake]
+                elif camel in payload and snake not in payload:
+                    payload[snake] = payload[camel]
+            return payload
+
+        source_testset_name = (req_data.get("source_testset_name") or "").strip()
+
+        # Template test set id: prefer exact name from UI (execution history), then explicit id, then JP's first TS.
+        template_ts_id = None
+        ts_name_resolved_id = None
+        if not create_fresh and source_testset_name:
+            try:
+                raw_q = json.dumps({"name": source_testset_name})
+                nm_resp = requests.get(
+                    f"{JITA_BASE}/test_sets",
+                    params={
+                        "raw_query": quote(raw_q),
+                        "limit": 1,
+                        "only": "_id,name,test_args,framework_args,tests,description",
+                    },
+                    auth=JITA_SVC_AUTH,
+                    verify=False,
+                    timeout=30,
+                )
+                if nm_resp.status_code == 200:
+                    items = nm_resp.json().get("data", []) if isinstance(nm_resp.json(), dict) else []
+                    if items and isinstance(items[0], dict):
+                        hit = items[0]
+                        hit_name = (hit.get("name") or "").strip()
+                        cand_id = _test_set_ref_oid(hit.get("_id"))
+                        if cand_id:
+                            if (
+                                hit_name == source_testset_name
+                                or hit_name.lower() == source_testset_name.lower()
+                            ):
+                                ts_name_resolved_id = cand_id
+                                logger.info(
+                                    f"[create] Template from source_testset_name={source_testset_name!r} -> id={ts_name_resolved_id}"
+                                )
+                            else:
+                                ts_name_resolved_id = cand_id
+                                logger.warning(
+                                    f"[create] Name query returned '{hit_name}' for requested={source_testset_name!r}; "
+                                    f"using single-hit id={ts_name_resolved_id}"
+                                )
+            except (requests.exceptions.RequestException, ValueError, TypeError) as e:
+                logger.warning(f"[create] source_testset_name lookup failed: {e}")
+
+        if ts_name_resolved_id:
+            template_ts_id = ts_name_resolved_id
+        elif source_testset_id:
+            template_ts_id = str(source_testset_id).strip() or None
+        if not create_fresh and not template_ts_id and source_jp:
+            refs = source_jp.get("test_sets") or []
+            if refs:
+                template_ts_id = _test_set_ref_oid(refs[0])
+                if template_ts_id and not source_testset_id and not source_testset_name:
+                    logger.info(
+                        f"[create] No source_testset_id/name in request; using source JP's first test set "
+                        f"as clone template: {template_ts_id}"
+                    )
+
+        # 2. Fetch template test set (non-fatal if it fails)
+        source_ts = {}
+        ts_fetch_warning = None
+        if template_ts_id:
+            try:
+                ts_resp = requests.get(
+                    f"{JITA_BASE}/test_sets/{template_ts_id}",
+                    auth=JITA_SVC_AUTH,
+                    verify=False,
+                    timeout=30
+                )
+                if ts_resp.status_code == 200:
+                    source_ts = _jit_pick_ts_dict_from_response(ts_resp.json())
+                    if source_ts:
+                        logger.info(
+                            f"[create] Loaded template TS id={template_ts_id} keys_sample={list(source_ts.keys())[:25]}"
+                        )
+                else:
+                    ts_fetch_warning = f"Could not fetch source test set (HTTP {ts_resp.status_code}). Proceeding without test_args copy."
+                    logger.warning(ts_fetch_warning)
+            except (requests.exceptions.RequestException, ValueError) as e:
+                ts_fetch_warning = f"Error fetching source test set: {e}. Proceeding without test_args copy."
+                logger.warning(ts_fetch_warning)
+
+        linked_ts_id_for_reuse = None
+        reuse_ts_display_name = None
+
+        if reuse_source_ts and not create_fresh:
+            tid = source_testset_id or ts_name_resolved_id
+            if not tid and source_jp:
+                refs = source_jp.get("test_sets") or []
+                if refs:
+                    tid = _test_set_ref_oid(refs[0])
+            if not tid:
+                return jsonify({
+                    "error": "reuse_source_ts requires a selected source test set or a source job profile "
+                             "that has at least one test set.",
+                }), 400
+            linked_ts_id_for_reuse = str(tid).strip()
+            st_oid = None
+            if source_ts:
+                st_oid = source_ts.get("_id")
+                if isinstance(st_oid, dict) and "$oid" in st_oid:
+                    st_oid = str(st_oid["$oid"])
+                elif st_oid is not None:
+                    st_oid = str(st_oid)
+            if source_ts and st_oid == linked_ts_id_for_reuse:
+                reuse_ts_display_name = (source_ts.get("name") or "").strip() or linked_ts_id_for_reuse
+            else:
+                try:
+                    tr = requests.get(
+                        f"{JITA_BASE}/test_sets/{linked_ts_id_for_reuse}",
+                        auth=JITA_SVC_AUTH,
+                        verify=False,
+                        timeout=30,
+                    )
+                    if tr.status_code == 200:
+                        tj = tr.json()
+                        td = _jit_pick_ts_dict_from_response(tj)
+                        if isinstance(td, dict):
+                            reuse_ts_display_name = (td.get("name") or "").strip() or linked_ts_id_for_reuse
+                    if not reuse_ts_display_name:
+                        reuse_ts_display_name = linked_ts_id_for_reuse
+                except (requests.exceptions.RequestException, ValueError):
+                    reuse_ts_display_name = linked_ts_id_for_reuse
+            logger.info(f"[create] reuse_source_ts=True, linked_ts_id={linked_ts_id_for_reuse}, name={reuse_ts_display_name}")
+
+        # 3. Sequential names: User_Dyn_<YYYYMMDD>_JP_N / User_Dyn_<YYYYMMDD>_TS_N
+        dyn_name_date = (req_data.get("dyn_name_date") or "").strip()
+        if dyn_name_date and (len(dyn_name_date) != 8 or not dyn_name_date.isdigit()):
+            return jsonify({"error": "dyn_name_date must be YYYYMMDD"}), 400
+        jp_prefix, ts_prefix = _dynamic_jp_ts_prefix_for_date(dyn_name_date or None)
+        date_key = _dyn_name_seq_date_key(dyn_name_date or None)
+        # Monotonic: bumps every /create, success or later failure, so JP_/TS_ numbers always advance
+        reserved_seq = _bump_dyn_name_seq(dyn_name_date or None)
+        if custom_jp_name:
+            custom_jp_name = _apply_reserved_seq_to_dyn_custom_name(custom_jp_name, date_key, reserved_seq)
+        if custom_ts_name and not (reuse_source_ts and linked_ts_id_for_reuse):
+            custom_ts_name = _apply_reserved_seq_to_dyn_custom_name(custom_ts_name, date_key, reserved_seq)
+
+        if custom_jp_name:
+            new_jp_name = custom_jp_name
+        else:
+            new_jp_name = f"{jp_prefix}{reserved_seq}"
+
+        if reuse_source_ts and linked_ts_id_for_reuse:
+            new_ts_name = reuse_ts_display_name or linked_ts_id_for_reuse
+        elif custom_ts_name:
+            new_ts_name = custom_ts_name
+        else:
+            new_ts_name = f"{ts_prefix}{reserved_seq}"
+
+        # 4. Pre-check: verify JP and TS names; pick alternatives if the requested name exists
+        def _name_exists(entity_type, name):
+            """Check if a JP or TS with this exact name already exists. Returns ID or None."""
+            try:
+                rq = json.dumps({"name": name})
+                logger.info(f"[create] Pre-check {entity_type} name='{name}', raw_query={rq}")
+                resp = requests.get(
+                    f"{JITA_BASE}/{entity_type}",
+                    params={"raw_query": rq, "limit": 1, "only": "_id,name"},
+                    auth=JITA_SVC_AUTH, verify=False, timeout=20,
+                )
+                logger.info(f"[create] Pre-check {entity_type} response: HTTP {resp.status_code}, "
+                            f"body={resp.text[:300]}")
+                if resp.status_code == 200:
+                    items = resp.json().get("data", [])
+                    if items and isinstance(items[0], dict):
+                        matched_name = items[0].get("name", "")
+                        if matched_name == name:
+                            eid = items[0].get("_id")
+                            if isinstance(eid, dict) and "$oid" in eid:
+                                return eid["$oid"]
+                            return str(eid) if eid else None
+                        else:
+                            logger.info(f"[create] Pre-check returned '{matched_name}' which doesn't exactly match '{name}', treating as no match")
+            except Exception as e:
+                logger.warning(f"[create] Pre-check for {entity_type} '{name}' failed: {e}")
+            return None
+
+        def _pick_unique_name(entity_type, base_name, kind="Job Profile"):
+            """If base_name is free, return (base_name, None). Otherwise use base_2, base_3, ... in JITA."""
+            if not base_name:
+                return base_name, None
+            if not _name_exists(entity_type, base_name):
+                return base_name, None
+            orig = base_name
+            for n in range(2, 5000):
+                candidate = f"{orig}_{n}"
+                if not _name_exists(entity_type, candidate):
+                    msg = f"{kind} name {orig!r} already exists in JITA; using {candidate!r} instead."
+                    logger.info(f"[create] {msg}")
+                    return candidate, msg
+            fallback = f"{orig}_{int(time.time())}"
+            return fallback, f"{kind} name {orig!r} exists; using time-based name {fallback!r}."
+
+        jp_name_adjust_warn = None
+        new_jp_name, _adj = _pick_unique_name("job_profiles", new_jp_name, "Job Profile")
+        if _adj:
+            jp_name_adjust_warn = _adj
+
+        existing_ts_id = None
+        if not (reuse_source_ts and linked_ts_id_for_reuse):
+            existing_ts_id = _name_exists("test_sets", new_ts_name)
+
+        ts_reused = False
+        ts_create_warning = None
+
+        if reuse_source_ts and linked_ts_id_for_reuse:
+            created_ts_id = linked_ts_id_for_reuse
+            ts_reused = True
+            if testcase_names:
+                ts_create_warning = (
+                    "reuse_source_ts: cloned job profile uses the existing test set unchanged; "
+                    "testcase names in the request were not written to JITA."
+                )
+            logger.info(f"[create] Linked JP to existing test set id={created_ts_id} (reuse_source_ts)")
+        elif existing_ts_id:
+            created_ts_id = existing_ts_id
+            ts_reused = True
+            ts_create_warning = f"Test set '{new_ts_name}' already exists (ID: {existing_ts_id}). Reusing it."
+            logger.info(f"[create] TS '{new_ts_name}' already exists, reusing ID {existing_ts_id}")
+        else:
+            # Build test entries
+            if testcase_names:
+                row_tmpl = {}
+                if isinstance(source_ts, dict):
+                    src_tests = source_ts.get("tests") or []
+                    if src_tests and isinstance(src_tests[0], dict):
+                        row_tmpl = {
+                            k: v
+                            for k, v in src_tests[0].items()
+                            if k not in ("_id", "name") and not str(k).startswith("__")
+                        }
+                test_entries = []
+                for tc in testcase_names:
+                    row = dict(row_tmpl)
+                    row["name"] = tc
+                    row.setdefault("framework_version", "nutest-py3-tests")
+                    row.setdefault("package_type", "tar")
+                    row.setdefault("service", "NutestPy3Tests")
+                    test_entries.append(row)
+            else:
+                test_entries = source_ts.get("tests", []) or []
+
+            if not create_fresh and source_ts:
+                ts_label = source_ts.get("name") or source_testset_id or template_ts_id or "unknown"
+                desc = f"Dynamic test set cloned from {ts_label}"
+                new_ts_payload = _build_clone_test_set_post_payload(source_ts, new_ts_name, test_entries, desc)
+            else:
+                _ta, _fa = _jit_ts_arg_strings(source_ts) if source_ts else ("", "")
+                new_ts_payload = {
+                    "name": new_ts_name,
+                    "tests": test_entries,
+                    "description": f"Dynamic test set with {len(test_entries)} testcase(s)",
+                    "test_args": _ta,
+                    "framework_args": _fa,
+                    "testArgs": _ta,
+                    "frameworkArgs": _fa,
+                }
+            # Clone: if source already had every default framework key, leave framework_args unchanged.
+            cloned_from_existing = bool(not create_fresh and source_ts)
+            _fa_for_skip = new_ts_payload.get("framework_args")
+            if _fa_for_skip in (None, ""):
+                _fa_for_skip = new_ts_payload.get("frameworkArgs")
+            if not (cloned_from_existing and _framework_args_dict_has_all_dyn_default_keys(_fa_for_skip)):
+                _apply_default_framework_options_to_test_set_payload(new_ts_payload)
+            _ta_log, _fa_log = _jit_ts_arg_strings(new_ts_payload)
+            logger.info(f"[create] TS payload: name={new_ts_name}, #tests={len(test_entries)}, "
+                        f"test_args_len={len(_ta_log)}, framework_args_len={len(_fa_log)}")
+
+            created_ts_id = None
+            try:
+                ts_create_resp = requests.post(
+                    f"{JITA_BASE}/test_sets",
+                    json=new_ts_payload,
+                    auth=JITA_SVC_AUTH, verify=False, timeout=30,
+                )
+                ts_resp_json = ts_create_resp.json() if ts_create_resp.content else {}
+                if ts_resp_json.get("success"):
+                    created_ts_id = str(ts_resp_json["id"]) if ts_resp_json.get("id") else None
+                    logger.info(f"Created test set: {new_ts_name} (ID: {created_ts_id})")
+                else:
+                    msg = ts_resp_json.get("message", f"HTTP {ts_create_resp.status_code}")
+                    ts_create_warning = f"Test set creation failed: {msg}"
+                    logger.warning(f"Failed to create test set: {msg}")
+                    return jsonify({"error": f"Failed to create test set '{new_ts_name}': {msg}"}), 500
+            except (requests.exceptions.RequestException, ValueError) as e:
+                logger.warning(f"Error creating test set: {e}")
+                return jsonify({"error": f"Error creating test set: {e}"}), 500
+
+        # 5. Build infra based on provider selection
+        def _build_infra(prov, res_type, np_list):
+            if prov == "global_pool":
+                if res_type == "physical":
+                    return [{"type": "physical", "kind": "PRIVATE_CLOUD", "params": {"category": "general"}}]
+                pool_name = "global_nested_2.0" if res_type == "nested_2.0" else "global_nested_1.0"
+                return [{"kind": "ON_PREM", "type": "cluster_pool", "entries": [pool_name]}]
+            elif prov == "node_pool":
+                entries = np_list if np_list else ["unknown"]
+                return [{"kind": "ON_PREM", "type": "node_pool", "entries": entries}]
+            elif prov == "static":
+                entries = np_list if np_list else ["unknown"]
+                return [{"kind": "ON_PREM", "type": "cluster", "entries": entries}]
+            return [{"kind": "ON_PREM", "type": "cluster_pool", "entries": ["global_nested_2.0"]}]
+
+        infra = _build_infra(provider, resource_type, node_pools)
+
+        # Build new JP payload
+        if create_fresh:
+            new_jp_payload = {
+                "name": new_jp_name,
+                "description": f"Dynamic JP with {len(testcase_names)} testcase(s)",
+                "test_sets": [],
+                "git": {},
+                "build_selection": {},
+                "resource_manager_json": {},
+                "infra": infra,
+                "requested_hardware": {
+                    "hypervisor": "kvm",
+                    "hypervisor_version": "branch_symlink",
+                    "imaging_options": {"redundancy_factor": "default", "min_ram": 32},
+                },
+                "services": ["NOS"],
+                "service": "AOS",
+                "test_framework": "nutest-py3-tests",
+                "nutest-py3-tests_branch": nutest_branch,
+                "system_under_test": {"product": "aos", "component": "main", "branch": nos_branch},
+            }
+        else:
+            import copy
+            new_jp_payload = copy.deepcopy(source_jp)
+            for field in ["_id", "created_at", "updated_at", "created_by", "__v"]:
+                new_jp_payload.pop(field, None)
+            new_jp_payload["name"] = new_jp_name
+            new_jp_payload["description"] = f"Dynamic JP cloned from {source_jp.get('name', source_jp_id)}"
+            new_jp_payload["test_sets"] = []
+            logger.info(f"[create] Source JP keys: {list(source_jp.keys())}")
+
+        # Link to new test set if created
+        if created_ts_id:
+            new_jp_payload["test_sets"] = [{"$oid": created_ts_id}]
+
+        if create_fresh:
+            # Fresh mode: apply all config from the UI
+            git = new_jp_payload.get("git") or {}
+            if not isinstance(git, dict):
+                git = {}
+            git["branch"] = nos_branch
+            git["repo"] = "main"
+            new_jp_payload["git"] = git
+
+            nos_build_type = "opt" if nos_branch.strip().lower() == "master" else "release"
+            pc_build_type = "opt" if pc_branch.strip().lower() == "master" else "release"
+
+            new_jp_payload["build_selection"] = {
+                "by_latest_smoked": nos_tag == "Latest Smoke Passed",
+                "commit_must_be_newer": False,
+                "build_type": nos_build_type,
+            }
+
+            resource_manager_json = new_jp_payload.get("resource_manager_json") or {}
+            if not isinstance(resource_manager_json, dict):
+                resource_manager_json = {}
+            if "NOS_CLUSTER" not in resource_manager_json:
+                resource_manager_json["NOS_CLUSTER"] = {}
+            resource_manager_json["PRISM_CENTRAL"] = {
+                "build": {
+                    "branch": pc_branch,
+                    "build_selection_build_type": pc_build_type,
+                    "build_selection_option": pc_tag,
+                }
+            }
+            new_jp_payload["resource_manager_json"] = resource_manager_json
+
+            test_framework_metadata = new_jp_payload.get("test_framework_metadata") or {}
+            if not isinstance(test_framework_metadata, dict):
+                test_framework_metadata = {}
+            test_meta = test_framework_metadata.get("test") or {}
+            if not isinstance(test_meta, dict):
+                test_meta = {}
+            test_meta["branch"] = nutest_branch
+            test_meta["commit"] = None
+            if test_patch_url:
+                test_meta["patch_url"] = test_patch_url
+            else:
+                test_meta.pop("patch_url", None)
+            framework_meta = test_framework_metadata.get("framework") or {}
+            if not isinstance(framework_meta, dict):
+                framework_meta = {}
+            framework_meta["branch"] = nutest_branch
+            framework_meta["commit"] = None
+            if framework_patch_url:
+                framework_meta["patch_url"] = framework_patch_url
+            else:
+                framework_meta.pop("patch_url", None)
+            test_framework_metadata["test"] = test_meta
+            test_framework_metadata["framework"] = framework_meta
+            new_jp_payload["test_framework_metadata"] = test_framework_metadata
+            new_jp_payload["test_framework"] = "nutest-py3-tests"
+            new_jp_payload["nutest-py3-tests_branch"] = nutest_branch
+            if framework_patch_url:
+                new_jp_payload["patch_url"] = framework_patch_url
+            else:
+                new_jp_payload.pop("patch_url", None)
+            new_jp_payload.pop("nutest_branch", None)
+
+            new_jp_payload["infra"] = infra
+        else:
+            # Clone mode: preserve source JP's config (infra, git, build, etc.)
+            # Only update name, description, test_sets (already done above)
+            logger.info(f"[create] Clone mode — preserving source JP config "
+                        f"(infra={new_jp_payload.get('infra', 'N/A')[:80] if isinstance(new_jp_payload.get('infra'), str) else 'present'})")
+            # User-supplied patch URLs (clone flow): fresh-create applied these above; clone had skipped them
+            if test_patch_url or framework_patch_url:
+                logger.info(
+                    f"[create] Clone mode — applying patches: test_patch_url={bool(test_patch_url)}, "
+                    f"framework_patch_url={bool(framework_patch_url)}"
+                )
+                tmeta = new_jp_payload.get("test_framework_metadata")
+                tmeta = dict(tmeta) if isinstance(tmeta, dict) else {}
+                test_m = tmeta.get("test")
+                test_m = dict(test_m) if isinstance(test_m, dict) else {}
+                fw_m = tmeta.get("framework")
+                fw_m = dict(fw_m) if isinstance(fw_m, dict) else {}
+                test_m["branch"] = nutest_branch
+                test_m["commit"] = None
+                fw_m["branch"] = nutest_branch
+                fw_m["commit"] = None
+                if test_patch_url:
+                    test_m["patch_url"] = test_patch_url
+                if framework_patch_url:
+                    fw_m["patch_url"] = framework_patch_url
+                tmeta["test"] = test_m
+                tmeta["framework"] = fw_m
+                new_jp_payload["test_framework_metadata"] = tmeta
+                new_jp_payload["test_framework"] = "nutest-py3-tests"
+                new_jp_payload["nutest-py3-tests_branch"] = nutest_branch
+                if framework_patch_url:
+                    new_jp_payload["patch_url"] = framework_patch_url
+
+        # Tags will be applied via a separate PUT after creation (same
+        # approach as Run Plan) because JITA's POST ignores tag fields.
+
+        # Deep sanitize: ensure JSON serializable (handle ObjectId, sets, bytes, etc.)
+        def sanitize_value(val):
+            if isinstance(val, dict):
+                return {k: sanitize_value(v) for k, v in val.items()}
+            elif isinstance(val, list):
+                return [sanitize_value(item) for item in val]
+            elif isinstance(val, (set, tuple)):
+                return [sanitize_value(item) for item in val]
+            elif isinstance(val, bytes):
+                return val.decode("utf-8", errors="replace")
+            elif val is Ellipsis:
+                return None
+            else:
+                return val
+
+        serializable_payload = sanitize_value(new_jp_payload)
+        logger.info(f"[create] Final JP payload — name: {serializable_payload.get('name')}, "
+                    f"tags: {serializable_payload.get('tags', 'MISSING')}, "
+                    f"adv_opts_keys: {list((serializable_payload.get('advanced_options') or {}).keys())}, "
+                    f"adv_tags: {(serializable_payload.get('advanced_options') or {}).get('tags', 'MISSING')}, "
+                    f"test_sets: {serializable_payload.get('test_sets', 'MISSING')}")
+
+        # 6. POST new JP
+        try:
+            jp_create_resp = requests.post(
+                f"{JITA_BASE}/job_profiles",
+                json=serializable_payload,
+                auth=JITA_SVC_AUTH,
+                verify=False,
+                timeout=30
+            )
+        except requests.exceptions.Timeout:
+            note = f" Note: Test set '{new_ts_name}' (ID: {created_ts_id}) was already created." if created_ts_id and not ts_reused else ""
+            return jsonify({"error": f"Timed out creating job profile on JITA.{note}"}), 504
+        except requests.exceptions.ConnectionError:
+            note = f" Note: Test set '{new_ts_name}' (ID: {created_ts_id}) was already created." if created_ts_id and not ts_reused else ""
+            return jsonify({"error": f"Could not connect to JITA to create job profile.{note}"}), 503
+
+        try:
+            jp_resp_json = jp_create_resp.json()
+        except (ValueError, TypeError):
+            jp_resp_json = {}
+
+        if not jp_resp_json.get("success"):
+            error_msg = jp_resp_json.get("message", f"HTTP {jp_create_resp.status_code}")
+            logger.error(f"Failed to create JP: {error_msg}")
+            note = f" Note: Test set '{new_ts_name}' (ID: {created_ts_id}) was already created." if created_ts_id and not ts_reused else ""
+            return jsonify({
+                "error": f"Failed to create Job Profile: {error_msg}.{note}",
+            }), 500
+
+        created_jp_id = jp_resp_json.get("id")
+        if created_jp_id:
+            created_jp_id = str(created_jp_id)
+
+        logger.info(f"Created JP: {new_jp_name} (ID: {created_jp_id})")
+
+        # 7. Apply tags via PUT (same approach as Run Plan — JITA ignores
+        # tag fields on POST but accepts them on PUT via tester_tags)
+        tag_warning = None
+        if jp_tags and created_jp_id:
+            logger.info(f"[create] Applying tags {jp_tags} to JP {created_jp_id} via PUT (tester_tags)")
+            try:
+                get_resp = requests.get(
+                    f"{JITA_BASE}/job_profiles/{created_jp_id}",
+                    auth=JITA_SVC_AUTH,                     verify=False, timeout=30,
+                )
+                if get_resp.status_code == 200:
+                    jp_data = get_resp.json().get("data", {})
+                    if isinstance(jp_data, dict):
+                        tester_tags = jp_data.get("tester_tags", [])
+                        if not isinstance(tester_tags, list):
+                            tester_tags = []
+                        merged = list(dict.fromkeys(tester_tags + jp_tags))
+                        jp_data["tester_tags"] = merged
+
+                        put_payload = {}
+                        for k, v in jp_data.items():
+                            if isinstance(v, (set, tuple)):
+                                put_payload[k] = list(v)
+                            elif v is Ellipsis:
+                                put_payload[k] = None
+                            else:
+                                put_payload[k] = v
+
+                        put_resp = requests.put(
+                            f"{JITA_BASE}/job_profiles/{created_jp_id}",
+                            json=put_payload,
+                            auth=JITA_SVC_AUTH,                             verify=False, timeout=30,
+                        )
+                        if put_resp.status_code == 200:
+                            logger.info(f"[create] Tags applied successfully: tester_tags={merged}")
+                        else:
+                            tag_warning = f"JP created but tags could not be applied (HTTP {put_resp.status_code})"
+                            logger.warning(f"[create] PUT tags failed: HTTP {put_resp.status_code} — {put_resp.text[:200]}")
+                    else:
+                        tag_warning = "JP created but could not re-fetch it to apply tags"
+                else:
+                    tag_warning = f"JP created but re-fetch for tags failed (HTTP {get_resp.status_code})"
+                    logger.warning(f"[create] GET for tag update failed: HTTP {get_resp.status_code}")
+            except Exception as e:
+                tag_warning = f"JP created but tags could not be applied: {e}"
+                logger.warning(f"[create] Tag update error: {e}")
+
+        warnings = []
+        if jp_name_adjust_warn:
+            warnings.append(jp_name_adjust_warn)
+        if ts_fetch_warning:
+            warnings.append(ts_fetch_warning)
+        if ts_create_warning:
+            warnings.append(ts_create_warning)
+        if tag_warning:
+            warnings.append(tag_warning)
+
+        ts_msg = ""
+        if created_ts_id:
+            ts_msg = f" (reused existing {new_ts_name})" if ts_reused else f" and {new_ts_name}"
+
+        return jsonify({
+            "success": True,
+            "reuse_source_ts": reuse_source_ts,
+            "job_profile": {
+                "_id": created_jp_id,
+                "name": new_jp_name,
+            },
+            "test_set": {
+                "_id": created_ts_id,
+                "name": new_ts_name,
+                "reused": ts_reused,
+            } if created_ts_id else None,
+            "message": f"Created {new_jp_name}{ts_msg}",
+            "warnings": warnings if warnings else None,
+        })
+    except Exception as e:
+        logger.error(f"Error in dynamic-jp create: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/mcp/regression/dynamic-jp/update", methods=["POST"])
+def dynamic_jp_update():
+    """Update an existing dynamic job profile or test set."""
+    try:
+        req_data = request.json
+        if not req_data:
+            return jsonify({"error": "Request body is required (JSON)"}), 400
+
+        jp_id = req_data.get("jp_id")
+        ts_id = req_data.get("ts_id")
+        updates = req_data.get("updates", {})
+
+        if not jp_id and not ts_id:
+            return jsonify({"error": "jp_id or ts_id is required"}), 400
+
+        if not isinstance(updates, dict):
+            return jsonify({"error": "updates must be a JSON object"}), 400
+
+        if jp_id:
+            jp_id = str(jp_id).strip()
+        if ts_id:
+            ts_id = str(ts_id).strip()
+
+        results = {}
+
+        if jp_id and updates.get("jp_updates"):
+            jp_updates = updates["jp_updates"]
+            if not isinstance(jp_updates, dict):
+                return jsonify({"error": "jp_updates must be a JSON object"}), 400
+
+            try:
+                get_resp = requests.get(
+                    f"{JITA_BASE}/job_profiles/{jp_id}",
+                    auth=JITA_SVC_AUTH,
+                    verify=False,
+                    timeout=30
+                )
+            except requests.exceptions.RequestException as e:
+                return jsonify({"error": f"Failed to connect to JITA to fetch JP {jp_id}: {e}"}), 503
+
+            if get_resp.status_code != 200:
+                return jsonify({"error": f"Failed to fetch JP {jp_id} (HTTP {get_resp.status_code})"}), 500
+
+            try:
+                existing = get_resp.json().get("data", {})
+            except (ValueError, TypeError):
+                return jsonify({"error": "Invalid JSON from JITA when fetching JP"}), 500
+
+            if not isinstance(existing, dict):
+                existing = {}
+            existing.update(jp_updates)
+
+            def sanitize(val):
+                if isinstance(val, dict):
+                    return {k: sanitize(v) for k, v in val.items()}
+                elif isinstance(val, list):
+                    return [sanitize(item) for item in val]
+                elif isinstance(val, (set, tuple)):
+                    return [sanitize(item) for item in val]
+                elif isinstance(val, bytes):
+                    return val.decode("utf-8", errors="replace")
+                elif val is Ellipsis:
+                    return None
+                return val
+
+            serializable = sanitize(existing)
+
+            try:
+                put_resp = requests.put(
+                    f"{JITA_BASE}/job_profiles/{jp_id}",
+                    json=serializable,
+                    auth=JITA_SVC_AUTH,
+                    verify=False,
+                    timeout=30
+                )
+                results["jp"] = {
+                    "success": put_resp.status_code == 200,
+                    "status_code": put_resp.status_code,
+                    "message": "Updated" if put_resp.status_code == 200 else f"JITA returned {put_resp.status_code}",
+                }
+            except requests.exceptions.RequestException as e:
+                results["jp"] = {"success": False, "error": str(e)}
+
+        if ts_id and updates.get("ts_updates"):
+            ts_updates = updates["ts_updates"]
+            if not isinstance(ts_updates, dict):
+                return jsonify({"error": "ts_updates must be a JSON object"}), 400
+
+            try:
+                get_resp = requests.get(
+                    f"{JITA_BASE}/test_sets/{ts_id}",
+                    auth=JITA_SVC_AUTH,
+                    verify=False,
+                    timeout=30
+                )
+            except requests.exceptions.RequestException as e:
+                return jsonify({"error": f"Failed to connect to JITA to fetch test set {ts_id}: {e}"}), 503
+
+            if get_resp.status_code != 200:
+                return jsonify({"error": f"Failed to fetch test set {ts_id} (HTTP {get_resp.status_code})"}), 500
+
+            try:
+                existing_ts = get_resp.json().get("data", {})
+            except (ValueError, TypeError):
+                return jsonify({"error": "Invalid JSON from JITA when fetching test set"}), 500
+
+            if not isinstance(existing_ts, dict):
+                existing_ts = {}
+            existing_ts.update(ts_updates)
+
+            try:
+                put_resp = requests.put(
+                    f"{JITA_BASE}/test_sets/{ts_id}",
+                    json=existing_ts,
+                    auth=JITA_SVC_AUTH,
+                    verify=False,
+                    timeout=30
+                )
+                results["ts"] = {
+                    "success": put_resp.status_code == 200,
+                    "status_code": put_resp.status_code,
+                    "message": "Updated" if put_resp.status_code == 200 else f"JITA returned {put_resp.status_code}",
+                }
+            except requests.exceptions.RequestException as e:
+                results["ts"] = {"success": False, "error": str(e)}
+
+        return jsonify({"success": True, "results": results})
+    except Exception as e:
+        logger.error(f"Error in dynamic-jp update: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/mcp/regression/dynamic-jp/search", methods=["POST"])
+def dynamic_jp_search():
+    """Search Job Profiles and Test Sets by name pattern."""
+    try:
+        req_data = request.json or {}
+        query = (req_data.get("query") or "").strip()
+        if len(query) < 2:
+            return jsonify({"error": "Search query must be at least 2 characters"}), 400
+
+        pattern = re.escape(query)
+        raw_q = json.dumps({"name": {"$regex": pattern, "$options": "i"}})
+        limit = min(int(req_data.get("limit", 20)), 50)
+
+        result = {"job_profiles": [], "test_sets": []}
+
+        try:
+            jp_resp = requests.get(
+                f"{JITA_BASE}/job_profiles",
+                params={"raw_query": raw_q, "limit": limit, "only": "_id,name,description,tags"},
+                auth=JITA_SVC_AUTH, verify=False, timeout=20,
+            )
+            if jp_resp.status_code == 200:
+                for item in (jp_resp.json().get("data", []) or []):
+                    if not isinstance(item, dict):
+                        continue
+                    eid = item.get("_id")
+                    if isinstance(eid, dict) and "$oid" in eid:
+                        eid = eid["$oid"]
+                    elif eid:
+                        eid = str(eid)
+                    result["job_profiles"].append({
+                        "_id": eid,
+                        "name": item.get("name", ""),
+                        "description": item.get("description", ""),
+                    })
+        except Exception as e:
+            logger.warning(f"[search] JP search failed: {e}")
+
+        try:
+            ts_resp = requests.get(
+                f"{JITA_BASE}/test_sets",
+                params={"raw_query": raw_q, "limit": limit, "only": "_id,name,description"},
+                auth=JITA_SVC_AUTH, verify=False, timeout=20,
+            )
+            if ts_resp.status_code == 200:
+                for item in (ts_resp.json().get("data", []) or []):
+                    if not isinstance(item, dict):
+                        continue
+                    eid = item.get("_id")
+                    if isinstance(eid, dict) and "$oid" in eid:
+                        eid = eid["$oid"]
+                    elif eid:
+                        eid = str(eid)
+                    result["test_sets"].append({
+                        "_id": eid,
+                        "name": item.get("name", ""),
+                        "description": item.get("description", ""),
+                    })
+        except Exception as e:
+            logger.warning(f"[search] TS search failed: {e}")
+
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        logger.error(f"Error in dynamic-jp search: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/mcp/regression/dynamic-jp/delete", methods=["POST"])
+def dynamic_jp_delete():
+    """Delete one or more Job Profiles and/or Test Sets by ID."""
+    try:
+        req_data = request.json or {}
+        jp_ids = req_data.get("jp_ids", [])
+        ts_ids = req_data.get("ts_ids", [])
+
+        if not jp_ids and not ts_ids:
+            return jsonify({"error": "At least one of jp_ids or ts_ids is required"}), 400
+
+        if not isinstance(jp_ids, list):
+            jp_ids = [jp_ids]
+        if not isinstance(ts_ids, list):
+            ts_ids = [ts_ids]
+
+        jp_ids = [str(i).strip() for i in jp_ids if i]
+        ts_ids = [str(i).strip() for i in ts_ids if i]
+
+        results = {"job_profiles": [], "test_sets": []}
+
+        for jp_id in jp_ids:
+            try:
+                resp = requests.delete(
+                    f"{JITA_BASE}/job_profiles/{jp_id}",
+                    auth=JITA_SVC_AUTH, verify=False, timeout=30,
+                )
+                success = resp.status_code in (200, 204)
+                msg = "Deleted" if success else f"JITA returned HTTP {resp.status_code}"
+                if not success:
+                    try:
+                        msg = resp.json().get("message", msg)
+                    except Exception:
+                        pass
+                results["job_profiles"].append({
+                    "_id": jp_id,
+                    "success": success,
+                    "message": msg,
+                })
+                logger.info(f"[delete] JP {jp_id}: {'OK' if success else 'FAILED'} ({msg})")
+            except Exception as e:
+                results["job_profiles"].append({
+                    "_id": jp_id,
+                    "success": False,
+                    "message": str(e),
+                })
+                logger.warning(f"[delete] JP {jp_id} error: {e}")
+
+        for ts_id in ts_ids:
+            try:
+                resp = requests.delete(
+                    f"{JITA_BASE}/test_sets/{ts_id}",
+                    auth=JITA_SVC_AUTH, verify=False, timeout=30,
+                )
+                success = resp.status_code in (200, 204)
+                msg = "Deleted" if success else f"JITA returned HTTP {resp.status_code}"
+                if not success:
+                    try:
+                        msg = resp.json().get("message", msg)
+                    except Exception:
+                        pass
+                results["test_sets"].append({
+                    "_id": ts_id,
+                    "success": success,
+                    "message": msg,
+                })
+                logger.info(f"[delete] TS {ts_id}: {'OK' if success else 'FAILED'} ({msg})")
+            except Exception as e:
+                results["test_sets"].append({
+                    "_id": ts_id,
+                    "success": False,
+                    "message": str(e),
+                })
+                logger.warning(f"[delete] TS {ts_id} error: {e}")
+
+        all_ok = all(r["success"] for r in results["job_profiles"] + results["test_sets"])
+        return jsonify({"success": all_ok, "results": results})
+    except Exception as e:
+        logger.error(f"Error in dynamic-jp delete: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 
 # ======================================================

@@ -1,12 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import axios from 'axios';
+import api from '../api';
 import { API_BASE_URL } from '../config';
+import { useTaskContext } from '../context/TaskContext';
 import './RunPlan.css';
 
 const API_BASE = `${API_BASE_URL}/mcp/regression/run-plan`;
 const JITA_BASE = 'https://jita.eng.nutanix.com/api/v2';
 
 export default function RunPlan() {
+  const { addTask, updateTask: updateTaskCtx } = useTaskContext();
   const [view, setView] = useState('list'); // 'list', 'create', 'edit', 'history', 'batch-update'
   const [runPlans, setRunPlans] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -69,7 +71,7 @@ export default function RunPlan() {
   const fetchRunPlans = async () => {
     setLoading(true);
     try {
-      const response = await axios.get(API_BASE);
+      const response = await api.get(API_BASE);
       setRunPlans(response.data.run_plans || []);
     } catch (error) {
       console.error('Error fetching run plans:', error);
@@ -109,7 +111,7 @@ export default function RunPlan() {
       try {
         const jobProfileIds = runPlan.job_profiles.filter(id => id && id.trim());
         if (jobProfileIds.length > 0) {
-          const response = await axios.post(`${API_BASE}/search-job-profiles`, {
+          const response = await api.post(`${API_BASE}/search-job-profiles`, {
             search_type: 'id',
             search_value: jobProfileIds.join(',')
           });
@@ -154,7 +156,7 @@ export default function RunPlan() {
   const handleSearchJobProfiles = async () => {
     setSearching(true);
     try {
-      const response = await axios.post(`${API_BASE}/search-job-profiles`, {
+      const response = await api.post(`${API_BASE}/search-job-profiles`, {
         search_type: formData.jobProfileSearchType,
         search_value: formData.jobProfileSearchType === 'id' 
           ? formData.jobProfileIds 
@@ -212,6 +214,8 @@ export default function RunPlan() {
     }
 
     setLoading(true);
+    const verb = view === 'create' ? 'Create' : 'Update';
+    const taskId = addTask({ label: `${verb} Run Plan: ${formData.name}`, page: 'Run Plan' });
     try {
       const payload = {
         name: formData.name,
@@ -219,26 +223,26 @@ export default function RunPlan() {
         schedule_date: formData.scheduleDate || null
       };
       
-      // Only include tag_name if it's a new run plan (create mode)
       if (view === 'create') {
-        // Generate tag name automatically
         const branch = formData.name.split('_').pop() || 'master';
         const timestamp = Date.now();
         payload.tag_name = `${branch}_${timestamp}`;
       }
 
       if (view === 'create') {
-        await axios.post(API_BASE, payload);
+        await api.post(API_BASE, payload);
       } else {
-        await axios.put(`${API_BASE}/${selectedRunPlan.id}`, payload);
+        await api.put(`${API_BASE}/${selectedRunPlan.id}`, payload);
       }
       
       alert(`Run Plan ${view === 'create' ? 'created' : 'updated'} successfully`);
+      updateTaskCtx(taskId, { status: 'success', detail: `${verb}d successfully` });
       setView('list');
       fetchRunPlans();
     } catch (error) {
       console.error('Error saving run plan:', error);
       alert(`Failed to ${view === 'create' ? 'create' : 'update'} run plan`);
+      updateTaskCtx(taskId, { status: 'error', detail: error.message });
     } finally {
       setLoading(false);
     }
@@ -250,13 +254,17 @@ export default function RunPlan() {
     }
 
     setLoading(true);
+    const taskId = addTask({ label: `Trigger Run Plan: ${runPlanId}`, page: 'Run Plan' });
     try {
-      const response = await axios.post(`${API_BASE}/${runPlanId}/trigger`);
-      alert(`Triggered successfully! Created ${response.data.task_ids?.length || 0} task(s)`);
+      const response = await api.post(`${API_BASE}/${runPlanId}/trigger`);
+      const count = response.data.task_ids?.length || 0;
+      alert(`Triggered successfully! Created ${count} task(s)`);
+      updateTaskCtx(taskId, { status: 'success', detail: `Created ${count} JITA task(s)` });
       fetchRunPlans();
     } catch (error) {
       console.error('Error triggering run plan:', error);
       alert('Failed to trigger run plan');
+      updateTaskCtx(taskId, { status: 'error', detail: error.message });
     } finally {
       setLoading(false);
     }
@@ -369,7 +377,8 @@ export default function RunPlan() {
         payload.tester_tag_value = batchUpdateData.testerTagValue;
       }
 
-      const response = await axios.post(
+      const batchTaskId = addTask({ label: `Batch Update: ${selectedRunPlan.name}`, page: 'Run Plan' });
+      const response = await api.post(
         `${API_BASE}/${selectedRunPlan.id}/batch-update`,
         payload
       );
@@ -379,8 +388,10 @@ export default function RunPlan() {
       if (failedCount > 0) {
         const failedIds = response.data.failed_updates.map(f => f.job_id).join(', ');
         alert(`Batch update completed with errors:\n✅ Updated: ${updatedCount}\n❌ Failed: ${failedCount}\n\nFailed IDs: ${failedIds}`);
+        updateTaskCtx(batchTaskId, { status: 'error', detail: `${updatedCount} updated, ${failedCount} failed` });
       } else {
         alert(`✅ Batch update completed successfully! Updated ${updatedCount} job profile(s)`);
+        updateTaskCtx(batchTaskId, { status: 'success', detail: `Updated ${updatedCount} job profile(s)` });
       }
       
       setView('list');
@@ -396,7 +407,7 @@ export default function RunPlan() {
   const handleViewHistory = async (runPlanId) => {
     setLoading(true);
     try {
-      const response = await axios.get(`${API_BASE}/${runPlanId}/history`);
+      const response = await api.get(`${API_BASE}/${runPlanId}/history`);
       setHistoryData(response.data.history || []);
       setSelectedRunPlan(runPlans.find(rp => rp.id === runPlanId));
       setView('history');
@@ -415,7 +426,7 @@ export default function RunPlan() {
 
     setLoading(true);
     try {
-      const response = await axios.post(`${API_BASE}/${runPlanId}/clone`);
+      const response = await api.post(`${API_BASE}/${runPlanId}/clone`);
       if (response.data.success) {
         alert(`Run plan cloned successfully! New tag: ${response.data.run_plan.tag_name}`);
         fetchRunPlans();
@@ -434,7 +445,7 @@ export default function RunPlan() {
   const handleRetryTrigger = async (historyEntryId) => {
     setLoading(true);
     try {
-      const response = await axios.post(`${API_BASE}/history/${historyEntryId}/retry`);
+      const response = await api.post(`${API_BASE}/history/${historyEntryId}/retry`);
       alert('Retry triggered successfully!');
       if (selectedRunPlan) {
         handleViewHistory(selectedRunPlan.id);
@@ -454,7 +465,7 @@ export default function RunPlan() {
 
     setLoading(true);
     try {
-      await axios.delete(`${API_BASE}/history/${historyEntryId}`);
+      await api.delete(`${API_BASE}/history/${historyEntryId}`);
       alert('History entry deleted');
       if (selectedRunPlan) {
         handleViewHistory(selectedRunPlan.id);
@@ -471,7 +482,7 @@ export default function RunPlan() {
     e.preventDefault();
     try {
       // Fetch history to get the latest entry's task IDs
-      const response = await axios.get(`${API_BASE}/${runPlanId}/history`);
+      const response = await api.get(`${API_BASE}/${runPlanId}/history`);
       const history = response.data.history || [];
       
       // Filter to only successful runs (status === 'success' or 'Success' or 'completed' or 'Completed')
@@ -529,7 +540,7 @@ export default function RunPlan() {
 
     setLoading(true);
     try {
-      const response = await axios.post(`${API_BASE}/${runPlanId}/delete-tag`, {
+      const response = await api.post(`${API_BASE}/${runPlanId}/delete-tag`, {
         tag_name: tagName
       });
       alert(`Tag "${tagName}" removed from ${response.data.updated_count || 0} job profile(s)`);

@@ -1,11 +1,13 @@
 import React, { useState, useEffect } from 'react';
-import axios from 'axios';
+import api from '../api';
 import { API_BASE_URL } from '../config';
+import { useTaskContext } from '../context/TaskContext';
 import './TriageGenie.css';
 
 const API_BASE = `${API_BASE_URL}/mcp/regression/triage-genie`;
 
 export default function TriageGenie() {
+  const { addTask, updateTask: updateTaskCtx } = useTaskContext();
   const [jobs, setJobs] = useState([]);
   const [loading, setLoading] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -60,7 +62,7 @@ export default function TriageGenie() {
   const fetchJobs = async () => {
     setLoading(true);
     try {
-      const response = await axios.get(`${API_BASE}/jobs`, {
+      const response = await api.get(`${API_BASE}/jobs`, {
         params: {
           page: 1,
           per_page: 10,
@@ -99,8 +101,9 @@ export default function TriageGenie() {
     }
 
     setLoading(true);
+    const taskId = addTask({ label: `Create Triage Job: ${formData.name}`, page: 'Triage Genie' });
     try {
-      const response = await axios.post(`${API_BASE}/jobs`, {
+      const response = await api.post(`${API_BASE}/jobs`, {
         name: formData.name,
         jita_task_ids: formData.jita_task_ids,
         skip_review: formData.skip_review,
@@ -109,6 +112,7 @@ export default function TriageGenie() {
 
       if (response.data.success) {
         alert('Job created successfully!');
+        updateTaskCtx(taskId, { status: 'success', detail: 'Job created' });
         setShowCreateModal(false);
         setFormData({
           name: '',
@@ -120,6 +124,7 @@ export default function TriageGenie() {
       } else {
         const errorMsg = response.data.error || 'Unknown error';
         alert(`Failed to create job: ${errorMsg}`);
+        updateTaskCtx(taskId, { status: 'error', detail: errorMsg });
         if (errorMsg.includes('authentication') || errorMsg.includes('TRIAGE_GENIE_TOKEN')) {
           console.error('Authentication error: Please set TRIAGE_GENIE_TOKEN environment variable');
         }
@@ -128,6 +133,7 @@ export default function TriageGenie() {
       console.error('Error creating job:', error);
       const errorMsg = error.response?.data?.error || error.message;
       alert(`Failed to create job: ${errorMsg}`);
+      updateTaskCtx(taskId, { status: 'error', detail: errorMsg });
       if (errorMsg.includes('authentication') || errorMsg.includes('401')) {
         console.error('Authentication error: Please set TRIAGE_GENIE_TOKEN environment variable');
       }

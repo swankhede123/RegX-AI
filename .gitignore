@@ -205,3 +205,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local monotonic User_Dyn_* JP/TS sequence (RegX dynamic-jp)
+backend/.dyn_name_sequence.json
